@@ -5,6 +5,7 @@
 #include <list>
 #include <vector>
 #include <set>
+#include <cstdint>
 class locality{
  public:
     locality();
