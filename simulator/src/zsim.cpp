@@ -27,6 +27,7 @@
 /* The Pin-facing part of the simulator */
 
 #include "zsim.h"
+#include "ramulator2_mem_ctrl.h"
 #include <algorithm>
 //#include <bits/signum.h>
 #include <signal.h>
@@ -1177,6 +1178,9 @@ VOID SimEnd() {
 
 
     if(zinfo->ramulator_memory) zinfo->ramulator->finish();
+#ifdef _WITH_RAMULATOR2_
+    if (zinfo->ramulator2) zinfo->ramulator2->finish();
+#endif
     dram_requests.close();
     exit(0);
 }

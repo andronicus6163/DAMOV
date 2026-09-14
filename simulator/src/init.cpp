@@ -45,6 +45,7 @@
 #include "debug_zsim.h"
 #include "dramsim_mem_ctrl.h"
 #include "ramulator_mem_ctrl.h"
+#include "ramulator2_mem_ctrl.h"
 #include "event_queue.h"
 #include "filter_cache.h"
 #include "galloc.h"
@@ -381,6 +382,13 @@ MemObject* BuildMemoryController(Config& config, uint32_t lineSize, uint32_t fre
         mem = new Ramulator(ramulatorConfig, zinfo->numCores, lineSize, latency, domain, name, pimMode, application, frequency, record_memory_trace,networkOverhead);
         zinfo ->  ramulator_memory = true;
         zinfo -> ramulator = static_cast<Ramulator*>(mem);
+#ifdef _WITH_RAMULATOR2_
+    } else if (type == "Ramulator2") {
+        string ramulatorConfig = config.get<const char*>("sys.mem.ramulatorConfig");
+        string statsPath = string(zinfo->outputDir) + "/" + config.get<const char*>("sim.stats") + ".ramulator2.stats.yaml";
+        mem = new Ramulator2(ramulatorConfig, zinfo->numCores, lineSize, latency, domain, name, statsPath);
+        zinfo->ramulator2 = static_cast<Ramulator2*>(mem);
+#endif
     } else if (type == "Detailed") {
         // FIXME(dsm): Don't use a separate config file... see DDRMemory
         g_string mcfg = config.get<const char*>("sys.mem.paramFile", "");

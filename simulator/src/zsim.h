@@ -51,6 +51,7 @@ class PortVirtualizer;
 class VectorCounter;
 class AccessTraceWriter;
 class TraceDriver;
+class Ramulator2;
 template <typename T> class g_vector;
 
 struct ClockDomainInfo {
@@ -191,6 +192,7 @@ struct GlobSimInfo {
 
     bool ramulator_memory = false;
     Ramulator  *ramulator;
+    Ramulator2 *ramulator2 = nullptr;
     std::string application;
     std::string to_record_stats;
 

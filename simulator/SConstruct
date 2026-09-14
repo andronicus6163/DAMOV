@@ -163,6 +163,14 @@ def buildSim(cppFlags, dir, type, pgo=None):
         env["PINLIBS"] += ["ramulator"]
         env["CPPFLAGS"] += " -D_WITH_RAMULATOR_=1 "
 
+    if "RAMULATOR2PATH" in os.environ:
+        RAMULATOR2PATH = os.environ["RAMULATOR2PATH"]
+        env["LINKFLAGS"] += " -Wl,-R" + RAMULATOR2PATH
+        env["PINLIBPATH"] += [RAMULATOR2PATH]
+        env["CPPPATH"] += [joinpath(RAMULATOR2PATH, "src")]
+        env["PINLIBS"] += ["ramulator2"]
+        env["CPPFLAGS"] += " -D_WITH_RAMULATOR2_=1 "
+
 
 
     env["CPPPATH"] += ["."]
