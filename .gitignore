@@ -28,3 +28,12 @@ megatools-1.11.1.20230212-linux-x86_64/
 workloads/
 simulator/zsim_stats/
 simulator/smoke_test/stream_roi
+
+# --- build/tooling byproducts from the zsim + ramulator build (do not commit) ---
+*.dep
+*.deppo
+.sconsign.dblite
+autom4te.cache/
+pin.log
+*.orig
+.toolchains/scons2
