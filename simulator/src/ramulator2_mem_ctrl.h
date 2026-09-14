@@ -19,9 +19,14 @@ class Ramulator2 : public MemObject {
     uint32_t domain;
     uint32_t minLatency;
     int sizeBytes;
+    uint32_t reqFlags;
     std::string statsPath;
     r2_sim* sim;
     uint64_t curCycle;
+    bool nsClock;
+    double cpuNs;
+    double memNs;
+    double diffNs;
     std::deque<Ramulator2AccEvent*> overflowQueue;
 
     PAD();
@@ -30,14 +35,16 @@ class Ramulator2 : public MemObject {
     Counter profTotalRdLat;
     Counter profTotalWrLat;
     Counter reissuedAccesses;
+    Counter memTicks;
     PAD();
 
     bool trySend(Ramulator2AccEvent* ev);
-    static void onComplete(void* ctx, uint64_t token, uint64_t addr, int type, int sourceId);
+    static void onComplete(void* ctx, uint64_t token, uint64_t addr, int type, int sourceId, int hops);
 
   public:
     Ramulator2(const std::string& configFile, unsigned numCores, unsigned lineSize, uint32_t minLatency,
-               uint32_t domain, const g_string& name, const std::string& statsPath);
+               uint32_t domain, const g_string& name, const std::string& statsPath, uint32_t cpuFreqMHz,
+               const std::string& clockMode, bool pimMode);
     ~Ramulator2();
 
     const char* getName() { return name.c_str(); }

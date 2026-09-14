@@ -32,14 +32,22 @@ class Ramulator2AccEvent : public TimingEvent {
 };
 
 Ramulator2::Ramulator2(const std::string& configFile, unsigned numCores, unsigned lineSize, uint32_t _minLatency,
-                       uint32_t _domain, const g_string& _name, const std::string& _statsPath)
-    : name(_name), domain(_domain), minLatency(_minLatency), statsPath(_statsPath), curCycle(0) {
+                       uint32_t _domain, const g_string& _name, const std::string& _statsPath, uint32_t cpuFreqMHz,
+                       const std::string& clockMode, bool pimMode)
+    : name(_name), domain(_domain), minLatency(_minLatency), statsPath(_statsPath), curCycle(0), diffNs(0) {
     sim = r2_create_from_file_cores(configFile.c_str(), numCores);
     if (!sim) panic("[RAMULATOR2] Cannot create memory system from %s: %s", configFile.c_str(), r2_last_error());
 
+    if (clockMode == "r1") nsClock = false;
+    else if (clockMode == "ns") nsClock = true;
+    else panic("[RAMULATOR2] sys.mem.clockMode must be \"r1\" or \"ns\", got %s", clockMode.c_str());
+    cpuNs = 1e3 / cpuFreqMHz;
+    memNs = r2_get_tck_ns(sim);
+    reqFlags = pimMode ? R2_FLAG_PIM : 0;
+
     sizeBytes = std::min<int>(lineSize, r2_get_tx_bytes(sim));
-    info("[RAMULATOR2] %s: tCK %.3f ns, %u cores, request size %d bytes", configFile.c_str(), r2_get_tck_ns(sim),
-         numCores, sizeBytes);
+    info("[RAMULATOR2] %s: tCK %.3f ns, cpu %.3f ns, clock %s, %u cores, request size %d bytes", configFile.c_str(),
+         memNs, cpuNs, clockMode.c_str(), numCores, sizeBytes);
 
     TickEvent<Ramulator2>* tickEv = new TickEvent<Ramulator2>(this, domain);
     tickEv->queue(0);
@@ -57,6 +65,7 @@ void Ramulator2::initStats(AggregateStat* parentStat) {
     profTotalRdLat.init("rdlat", "Total latency experienced by read requests"); memStats->append(&profTotalRdLat);
     profTotalWrLat.init("wrlat", "Total latency experienced by write requests"); memStats->append(&profTotalWrLat);
     reissuedAccesses.init("reissuedAccesses", "Number of accesses that were reissued due to full queue"); memStats->append(&reissuedAccesses);
+    memTicks.init("memTicks", "Memory-model ticks simulated"); memStats->append(&memTicks);
     parentStat->append(memStats);
 }
 
@@ -92,15 +101,25 @@ uint64_t Ramulator2::access(MemReq& req) {
 
 bool Ramulator2::trySend(Ramulator2AccEvent* ev) {
     ev->hold();
-    int ok = r2_send(sim, ev->isWrite() ? R2_WRITE : R2_READ, ev->getAddr(), ev->getCoreId(), sizeBytes,
-                     reinterpret_cast<uint64_t>(ev), &Ramulator2::onComplete, this);
+    int ok = r2_send_ex(sim, ev->isWrite() ? R2_WRITE : R2_READ, ev->getAddr(), ev->getCoreId(), sizeBytes, reqFlags,
+                        reinterpret_cast<uint64_t>(ev), &Ramulator2::onComplete, this);
     if (ok < 0) panic("[RAMULATOR2] send failed: %s", r2_last_error());
     if (!ok) ev->release();
     return ok;
 }
 
 uint32_t Ramulator2::tick(uint64_t cycle) {
-    r2_tick(sim);
+    if (nsClock) {
+        diffNs += cpuNs;
+        while (diffNs >= memNs) {
+            r2_tick(sim);
+            memTicks.inc();
+            diffNs -= memNs;
+        }
+    } else {
+        r2_tick(sim);
+        memTicks.inc();
+    }
     if (!overflowQueue.empty() && trySend(overflowQueue.front())) overflowQueue.pop_front();
     curCycle++;
     return 1;
@@ -113,7 +132,7 @@ void Ramulator2::enqueue(Ramulator2AccEvent* ev, uint64_t cycle) {
     }
 }
 
-void Ramulator2::onComplete(void* ctx, uint64_t token, uint64_t addr, int type, int sourceId) {
+void Ramulator2::onComplete(void* ctx, uint64_t token, uint64_t addr, int type, int sourceId, int hops) {
     Ramulator2* self = static_cast<Ramulator2*>(ctx);
     Ramulator2AccEvent* ev = reinterpret_cast<Ramulator2AccEvent*>(token);
     uint32_t lat = self->curCycle + 1 - ev->sCycle;

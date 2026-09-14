@@ -37,3 +37,7 @@ autom4te.cache/
 pin.log
 *.orig
 .toolchains/scons2
+
+# --- workload run byproducts written to the zsim working directory (do not commit) ---
+simulator/hpcg*.txt
+simulator/HPCG-Benchmark*.txt

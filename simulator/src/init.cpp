@@ -386,7 +386,8 @@ MemObject* BuildMemoryController(Config& config, uint32_t lineSize, uint32_t fre
     } else if (type == "Ramulator2") {
         string ramulatorConfig = config.get<const char*>("sys.mem.ramulatorConfig");
         string statsPath = string(zinfo->outputDir) + "/" + config.get<const char*>("sim.stats") + ".ramulator2.stats.yaml";
-        mem = new Ramulator2(ramulatorConfig, zinfo->numCores, lineSize, latency, domain, name, statsPath);
+        mem = new Ramulator2(ramulatorConfig, zinfo->numCores, lineSize, latency, domain, name, statsPath, frequency,
+                             config.get<const char*>("sys.mem.clockMode", "r1"), config.get<bool>("sim.pimMode", false));
         zinfo->ramulator2 = static_cast<Ramulator2*>(mem);
 #endif
     } else if (type == "Detailed") {
