@@ -88,7 +88,7 @@ uint64_t MESIBottomCC::processAccess(Address lineAddr, uint32_t lineId, AccessTy
     uint64_t respCycle = cycle;
     MESIState* state = &array[lineId];
 
-    if(bypass){
+    if(bypass || (flags & MemReq::UNCACHED)){
         uint32_t parentId = getParentId(lineAddr);
         MemReq req = {lineAddr, type, selfId, state , cycle, &ccLock, *state, srcId, flags};
         return parents[parentId]->access(req); // We send the request to the next level

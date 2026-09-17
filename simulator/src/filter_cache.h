@@ -101,8 +101,26 @@ class FilterCache : public Cache {
             parentStat->append(cacheStat);
         }
 
+        // An access inside the uncached window never hits: it is sent up the hierarchy every time (see
+        // MemReq::UNCACHED). Used for the host<->PIM mailbox, which is DRAM both sides can see but neither caches.
+        inline bool isUncached(Address vAddr) const {
+            return unlikely(zinfo->uncachedHi) && vAddr >= zinfo->uncachedLo && vAddr < zinfo->uncachedHi;
+        }
+
+        uint64_t uncachedAccess(Address vLineAddr, bool isLoad, uint64_t curCycle) {
+            Address pLineAddr = procMask | vLineAddr;
+            MESIState dummyState = MESIState::I;
+            futex_lock(&filterLock);
+            MemReq req = {pLineAddr, isLoad? GETS : GETX, 0, &dummyState, curCycle, &filterLock, dummyState, srcId,
+                          reqFlags | MemReq::UNCACHED};
+            uint64_t respCycle = access(req);
+            futex_unlock(&filterLock);
+            return respCycle;
+        }
+
         inline uint64_t load(Address vAddr, uint64_t curCycle) {
             Address vLineAddr = vAddr >> lineBits;
+            if (isUncached(vAddr)) return uncachedAccess(vLineAddr, true, curCycle);
             uint32_t idx = vLineAddr & setMask;
             uint64_t availCycle = filterArray[idx].availCycle; //read before, careful with ordering to avoid timing races
             if (vLineAddr == filterArray[idx].rdAddr) {
@@ -115,6 +133,7 @@ class FilterCache : public Cache {
 
         inline uint64_t store(Address vAddr, uint64_t curCycle) {
             Address vLineAddr = vAddr >> lineBits;
+            if (isUncached(vAddr)) return uncachedAccess(vLineAddr, false, curCycle);
             uint32_t idx = vLineAddr & setMask;
             uint64_t availCycle = filterArray[idx].availCycle; //read before, careful with ordering to avoid timing races
             if (vLineAddr == filterArray[idx].wrAddr) {

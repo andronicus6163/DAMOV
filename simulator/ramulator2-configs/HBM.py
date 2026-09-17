@@ -6,7 +6,10 @@ STANDARD = os.environ.get("HBM_STANDARD", "HBM3")
 ORG = os.environ.get("HBM_ORG", "HBM3_16Gb_8hi")
 TIMING = os.environ.get("HBM_TIMING", "HBM3_6400Mbps")
 SYSTEM = os.environ.get("HBM_SYSTEM", "HBMStack")
-CHANNELS = 16
+# One PIM unit per channel; `HBM_STACKS` stacks of 16 channels each (a barrier over more than 16 PIM units needs
+# more than one stack, and the host is the only path between stacks).
+STACKS = int(os.environ.get("HBM_STACKS", "1"))
+CHANNELS = 16 * STACKS
 
 frontend = ramulator.frontend.External(clock_ratio=1)
 
@@ -31,6 +34,9 @@ if SYSTEM == "HBMStack":
         base_die_hop_ps=int(os.environ.get("HBM_HOP_PS", "200")),
         pim_mesh_width=4,
         request_bytes=64,
+        stacks=STACKS,
+        # Guesstimate: host-side switch/link hop to reach a stack, each direction.
+        host_stack_link_ps=int(os.environ.get("HBM_STACK_LINK_PS", "0" if STACKS == 1 else "500")),
     )
 else:
     mem = ramulator.memory_system.GenericDRAM(

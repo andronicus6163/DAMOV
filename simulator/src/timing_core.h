@@ -68,6 +68,9 @@ class TimingCore : public Core {
         uint64_t getOffloadInstrs() const {return offload_instrs;}
         uint64_t getPhaseCycles() const;
         uint64_t getCycles() const {return cRec.getUnhaltedCycles(curCycle);}
+        uint64_t getCurCycle() const override {return curCycle;}
+        uint64_t getPhaseEnd() const override {return phaseEndCycle;}
+        void idleUntil(uint64_t cycle) override {if (cycle > curCycle) curCycle = cycle;}
 
         void initStats(AggregateStat* parentStat);
         void contextSwitch(int32_t gid);

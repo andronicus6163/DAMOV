@@ -27,6 +27,7 @@
 /* The Pin-facing part of the simulator */
 
 #include "zsim.h"
+#include "syncron/sync_engine.h"
 #include "ramulator2_mem_ctrl.h"
 #include <algorithm>
 //#include <bits/signum.h>
@@ -147,7 +148,7 @@ VOID SimThreadStart(THREADID tid);
 VOID SimThreadFini(THREADID tid);
 VOID SimEnd();
 
-VOID HandleMagicOp(THREADID tid, ADDRINT op);
+VOID HandleMagicOp(THREADID tid, ADDRINT op, ADDRINT arg0, ADDRINT arg1, ADDRINT arg2, ADDRINT* ret);
 
 VOID FakeCPUIDPre(THREADID tid, REG eax, REG ecx);
 VOID FakeCPUIDPost(THREADID tid, ADDRINT* eax, ADDRINT* ebx, ADDRINT* ecx, ADDRINT* edx); //REG* eax, REG* ebx, REG* ecx, REG* edx);
@@ -620,7 +621,9 @@ VOID Instruction(INS ins) {
      */
     if (INS_IsXchg(ins) && INS_OperandReg(ins, 0) == LEVEL_BASE::REG_RCX && INS_OperandReg(ins, 1) == LEVEL_BASE::REG_RCX) {
         //info("Instrumenting magic op");
-        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR) HandleMagicOp, IARG_THREAD_ID, IARG_REG_VALUE, REG_ECX, IARG_END);
+        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR) HandleMagicOp, IARG_THREAD_ID, IARG_REG_VALUE, REG_ECX,
+                       IARG_REG_VALUE, LEVEL_BASE::REG_RDI, IARG_REG_VALUE, LEVEL_BASE::REG_RSI,
+                       IARG_REG_VALUE, LEVEL_BASE::REG_RDX, IARG_REG_REFERENCE, LEVEL_BASE::REG_RAX, IARG_END);
     }
 
     if (INS_Opcode(ins) == XED_ICLASS_CPUID) {
@@ -1196,8 +1199,14 @@ VOID SimEnd() {
 #define ZSIM_MAGIC_OP_HEARTBEAT         (1028)
 #define ZSIM_MAGIC_OP_FUNCTION_BEGIN    (1031)
 #define ZSIM_MAGIC_OP_FUNCTION_END      (1032)
+#define ZSIM_MAGIC_OP_UNCACHED_REGION   (1040)
+#define ZSIM_MAGIC_OP_NOW               (1041)
+#define ZSIM_MAGIC_OP_REQ_SYNC          (1042)
+#define ZSIM_MAGIC_OP_REQ_ASYNC         (1043)
+#define ZSIM_MAGIC_OP_MSG_SEND          (1044)
+#define ZSIM_MAGIC_OP_MSG_RECV          (1045)
 
-VOID HandleMagicOp(THREADID tid, ADDRINT op) {
+VOID HandleMagicOp(THREADID tid, ADDRINT op, ADDRINT arg0, ADDRINT arg1, ADDRINT arg2, ADDRINT* ret) {
     //std::cout << "HandleMagicOp: " << op << std::endl;
     switch (op) {
         case ZSIM_MAGIC_OP_ROI_BEGIN:
@@ -1266,6 +1275,74 @@ VOID HandleMagicOp(THREADID tid, ADDRINT op) {
             //for (StatsBackend* backend : *(zinfo->statsBackends)) backend->dump(false /*unbuffered, write out*/);
             //cerr  << "@zsim.cpp - Offload end \n";
             fPtrs[tid].OffloadEnd(tid);
+            return;
+        case ZSIM_MAGIC_OP_NOW: {
+            // The calling core's own cycle count, weave corrections included. rdtsc is virtualised to
+            // globPhaseCycles + progress inside the phase, which is a nominal clock and drifts from the core's real
+            // cycle count when memory stalls stretch a phase; this does not.
+            uint32_t cid = getCid(tid);
+            if (ret) *ret = (cid < zinfo->numCores) ? zinfo->cores[cid]->getCycles() : 0;
+            return;
+        }
+        case ZSIM_MAGIC_OP_REQ_SYNC: {
+            // SynCron Sec 4.1: req_sync addr, opcode, info -- issue a message to the local SE and block until the
+            // ACK. The SE model returns the cycle the ACK arrives; the core is stalled until then, so the wait is
+            // the modelled hardware's, not a spin loop's.
+            if (!zinfo->syncron) panic("Thread %d used req_sync but sys.syncron is not configured", tid);
+            uint32_t cid = getCid(tid);
+            if (cid >= zinfo->numCores) return;
+            Core* core = zinfo->cores[cid];
+            uint64_t ack = zinfo->syncron->reqSync(cid, arg0, (uint32_t)arg1, arg2, core->getCurCycle());
+            if (ack) {
+                core->idleUntil(ack);  // the SE decided when this core resumes
+            } else {
+                // A barrier that is not complete yet. Park the core at the end of the phase so simulated time can
+                // advance for the participants that have not arrived, then let the application poll again. The poll
+                // itself is free in the model; only this phase granularity is visible to the application.
+                core->idleUntil(core->getPhaseEnd() + 1);
+            }
+            if (ret) *ret = ack;
+            return;
+        }
+        case ZSIM_MAGIC_OP_REQ_ASYNC: {
+            if (!zinfo->syncron) panic("Thread %d used req_async but sys.syncron is not configured", tid);
+            uint32_t cid = getCid(tid);
+            if (cid >= zinfo->numCores) return;
+            zinfo->syncron->reqAsync(cid, arg0, (uint32_t)arg1, arg2, zinfo->cores[cid]->getCurCycle());
+            return;
+        }
+        case ZSIM_MAGIC_OP_MSG_SEND: {
+            // The hardware message passing the paper's software baselines use (Sec 6): arg0 = destination core,
+            // arg1 = an opaque tag. Sending does not block the sender, so the core is not stalled.
+            if (!zinfo->syncron) panic("Thread %d used msg_send but sys.syncron is not configured", tid);
+            uint32_t cid = getCid(tid);
+            if (cid >= zinfo->numCores) return;
+            zinfo->syncron->msgSend(cid, (uint32_t)arg0, arg1, zinfo->cores[cid]->getCurCycle());
+            return;
+        }
+        case ZSIM_MAGIC_OP_MSG_RECV: {
+            // Takes the earliest message in this core's inbox and blocks the core until it has arrived. An empty
+            // inbox parks the core to the end of the phase (the same granularity a barrier poll has) and returns 0,
+            // so a server core waiting for work costs one magic op per phase rather than a spin loop.
+            if (!zinfo->syncron) panic("Thread %d used msg_recv but sys.syncron is not configured", tid);
+            uint32_t cid = getCid(tid);
+            if (cid >= zinfo->numCores) return;
+            Core* core = zinfo->cores[cid];
+            uint64_t word = 0, resume = 0;
+            if (zinfo->syncron->msgRecv(cid, core->getCurCycle(), &word, &resume)) {
+                core->idleUntil(resume);
+            } else {
+                core->idleUntil(core->getPhaseEnd() + 1);
+            }
+            if (ret) *ret = word;
+            return;
+        }
+        case ZSIM_MAGIC_OP_UNCACHED_REGION:
+            // arg0 = base address, arg1 = bytes. Accesses in [base, base+bytes) skip every cache (see
+            // MemReq::UNCACHED). One window, shared by all cores, set before the ROI.
+            zinfo->uncachedLo = arg0;
+            zinfo->uncachedHi = arg0 + arg1;
+            info("Uncached window: [0x%lx, 0x%lx) (%ld bytes)", (uint64_t)arg0, (uint64_t)(arg0 + arg1), (uint64_t)arg1);
             return;
         // HACK: Ubik magic ops
         case 1029:

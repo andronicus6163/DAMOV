@@ -375,7 +375,8 @@ class MESICC : public CC {
                 //if needed, fetch line or upgrade miss from upper level
                 respCycle = bcc->processAccess(req.lineAddr, lineId, req.type, startCycle, req.srcId, flags);
                 if (getDoneCycle) *getDoneCycle = respCycle;
-                if (!isPrefetch) { //prefetches only touch bcc; the demand request from the core will pull the line to lower level
+                if (!isPrefetch && !(flags & MemReq::UNCACHED)) { //prefetches only touch bcc; the demand request from the core will pull the line to lower level
+                                                                  //uncached accesses leave no sharer state behind, so children keep missing
                     //At this point, the line is in a good state w.r.t. upper levels
                     bool lowerLevelWriteback = false;
                     //change directory info, invalidate other children if needed, tell requester about its state

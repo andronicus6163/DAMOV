@@ -1,0 +1,31 @@
+# SynCron (Giannoula et al., HPCA'21, arXiv:2101.07557) -- the values we build against.
+# "source" is where the number comes from; "ours" is what we implement, and the note says why it differs if it does.
+param,paper,ours,source,note
+ndp_units,4,4,Table 5,one per memory stack
+cores_per_unit,16,16,Table 5,in-order
+core_type,in-order,in-order (zsim Timing),Table 5,
+core_mhz,2500,2000,Table 5,"user's decision; ratios between schemes unaffected. The cores are on a separate compute die (logic layer in 3D), so the DRAM's 500 MHz does not bound them; the paper gives no justification for 2.5 GHz and no thermal analysis"
+l1i_l1d_bytes,16384,16384,Table 5,private per core
+l1_ways,2,2,Table 5,
+l1_latency_cycles,4,4,Table 5,
+line_bytes,64,64,Table 5,
+shared_cache,none,none (bypassed LLC),Table 5,zsim needs one parentless cache group; bypass = no latency and no data
+coherence,none,none,Sec 1 and 4,SynCron's premise
+intra_unit_network,buffered crossbar 1-cycle arbitration + 1 cycle per hop M/D/1,zsim MeshNetworkMD1 with hop_delay=2 (arb+hop),Table 5,MeshNetworkMD1 charges rho/(2(1-rho)) per port = M/D/1
+inter_unit_bw_gbps_per_dir,12.8,to build in S2,Table 5,
+inter_unit_line_latency_ns,40,to build in S2,Table 5,20-cycle traversal
+memory,HBM 1.0 4 stacks 4 GB 500 MHz 8 channels per stack,Ramulator 2.1 HBM1_1Gb + HBM1_1Gbps x 32 controllers in HBMStack(stacks=4),Table 5,measured tCK 2.000 ns = 500 MHz; 8 ch x 128 MB = 1 GB per stack = 4 GB
+st_entries,64,64,Table 5,Synchronization Table
+st_bytes,1192,not modelled,Table 5,area only
+st_access_cycles,1,1,Table 5,
+indexing_counters,256,256,Table 5,indexed by address LSBs
+indexing_counter_cycles,2,2,Table 5,
+spu_mhz,1000,1000,Table 5,
+spu_buffer_bytes,280,not modelled,Table 5,area only
+spu_registers,8x64-bit,not modelled,Table 5,area only
+message_service_cycles,12,12,Sec 6 and Table 5,the longest message is barrier_depart_global
+client_cores_per_unit_baselines,15,15,Sec 6,Central and Hier spend one core per unit on a software server
+energy_l1_hit_pj,23,not modelled,Table 5,no power model in this stack
+energy_l1_miss_pj,47,not modelled,Table 5,
+energy_hop_pj_per_bit,0.4,not modelled,Table 5,
+energy_inter_unit_pj_per_bit,4,not modelled,Table 5,

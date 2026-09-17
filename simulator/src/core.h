@@ -98,6 +98,14 @@ class Core : public GlobAlloc {
         virtual uint64_t getPhaseCycles() const = 0; // used by RDTSC faking --- we need to know how far along we are in the phase, but not the total number of phases
         virtual uint64_t getCycles() const = 0;
 
+        /* Bound-phase clock, and a way to stall the core until a given cycle. Used by hardware that answers a core
+         * after a modelled delay (SynCron's Synchronization Engine: req_sync blocks until the ACK). The default is a
+         * no-op so core models that cannot block are unaffected. NOTE: this advances the bound-phase clock directly;
+         * the weave phase does not model the stall, the same approach MultiPIM's PIM cores use. */
+        virtual uint64_t getCurCycle() const {return 0;}
+        virtual uint64_t getPhaseEnd() const {return 0;}
+        virtual void idleUntil(uint64_t cycle) {}
+
         virtual void initStats(AggregateStat* parentStat) = 0;
         virtual void contextSwitch(int32_t gid) = 0; //gid == -1 means descheduled, otherwise this is the new gid
 

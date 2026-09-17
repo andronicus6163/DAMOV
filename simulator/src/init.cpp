@@ -79,6 +79,7 @@
 #include "tracing_cache.h"
 #include "virt/port_virtualizer.h"
 #include "weave_md1_mem.h"
+#include "syncron/sync_engine.h"
 #include "zsim.h"
 
 std::string application_path;
@@ -782,6 +783,15 @@ static void InitSystem(Config& config) {
         coreIdx = 0;
         for (const char* group : coreGroupNames) for (Core* core : coreMap[group]) zinfo->cores[coreIdx++] = core;
 
+        // Per-core PIM flag: a core group may opt in/out of the PIM memory path (host cores keep the host path).
+        bool defaultPim = config.get<bool>("sim.pimMode", false);
+        zinfo->corePim = gm_calloc<bool>(zinfo->numCores);
+        uint32_t pimIdx = 0;
+        for (const char* group : coreGroupNames) {
+            bool groupPim = config.get<bool>(string("sys.cores.") + group + ".pim", defaultPim);
+            for (size_t i = 0; i < coreMap[group].size(); i++) zinfo->corePim[pimIdx++] = groupPim;
+        }
+
         //Init stats: cores
         for (const char* group : coreGroupNames) {
             AggregateStat* groupStat = new AggregateStat(true);
@@ -966,6 +976,8 @@ void SimInit(const char* configFile, const char* outputDir, uint32_t shmid) {
     zinfo->compactPeriodicStats = config.get<bool>("sim.compactPeriodicStats", false);
 
     //Fast-forwarding and magic ops
+    zinfo->uncachedLo = config.get<uint64_t>("sim.uncachedLo", 0);
+    zinfo->uncachedHi = config.get<uint64_t>("sim.uncachedHi", 0);
     zinfo->ignoreHooks = config.get<bool>("sim.ignoreHooks", false);
     zinfo->ffReinstrument = config.get<bool>("sim.ffReinstrument", false);
     if (zinfo->ffReinstrument) warn("sim.ffReinstrument = true, switching fast-forwarding on a multi-threaded process may be unstable");
@@ -1016,6 +1028,38 @@ void SimInit(const char* configFile, const char* outputDir, uint32_t shmid) {
 
     //Caches, cores, memory controllers
     InitSystem(config);
+
+    // SynCron (HPCA'21): one Synchronization Engine per NDP unit. Absent sys.syncron.units, there is none, and
+    // req_sync/req_async panic if the application uses them.
+    zinfo->syncron = nullptr;
+    uint32_t syncronUnits = config.get<uint32_t>("sys.syncron.units", 0);
+    if (syncronUnits) {
+        syncron::Params sp;
+        sp.units = syncronUnits;
+        sp.cores_per_unit = config.get<uint32_t>("sys.syncron.coresPerUnit", zinfo->numCores / syncronUnits);
+        sp.st_entries = config.get<uint32_t>("sys.syncron.stEntries", 64);
+        sp.indexing_counters = config.get<uint32_t>("sys.syncron.indexingCounters", 256);
+        sp.spu_mhz = config.get<uint32_t>("sys.syncron.spuMHz", 1000);
+        sp.service_cycles = config.get<uint32_t>("sys.syncron.serviceCycles", 12);
+        sp.local_msg_cycles = config.get<uint32_t>("sys.syncron.localMsgCycles", 2);
+        sp.global_msg_cycles = config.get<uint32_t>("sys.syncron.globalMsgCycles", 80);
+        sp.bytes_per_unit = config.get<uint64_t>("sys.syncron.bytesPerUnit", 1ull << 30);
+        sp.overflow_mem_cycles = config.get<uint32_t>("sys.syncron.overflowMemCycles", 118);
+        sp.overflow_arrive_accesses = config.get<uint32_t>("sys.syncron.overflowArriveAccesses", 2);
+        sp.overflow_release_accesses = config.get<uint32_t>("sys.syncron.overflowReleaseAccesses", 2);
+        // Which of the paper's four systems this run models (Sec 6). Central and Hier coordinate in software on a
+        // dedicated NDP core and only use the message transport; Ideal has no synchronization cost at all.
+        const char* schemeStr = config.get<const char*>("sys.syncron.scheme", "syncron");
+        sp.scheme = syncron::SCHEME_COUNT;
+        for (uint32_t s = 0; s < syncron::SCHEME_COUNT; s++) {
+            if (!strcmp(schemeStr, syncron::scheme_name(s))) sp.scheme = s;
+        }
+        if (sp.scheme == syncron::SCHEME_COUNT) {
+            panic("sys.syncron.scheme = \"%s\" is not one of syncron|ideal|central|hier", schemeStr);
+        }
+        zinfo->syncron = new syncron::SyncronSystem(sp, zinfo->freqMHz, zinfo->numCores);
+        zinfo->syncron->initStats(zinfo->rootStat);
+    }
 
     //Sched stats (deferred because of circular deps)
     if (zinfo->sched) zinfo->sched->initStats(zinfo->rootStat);

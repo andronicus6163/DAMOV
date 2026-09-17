@@ -76,10 +76,22 @@ enum ProcExitStatus {
     PROC_RESTARTME  = 2
 };
 
+namespace syncron { class SyncronSystem; }
+
 struct GlobSimInfo {
     //System configuration values, all read-only, set at initialization
     uint32_t numCores;
+    bool* corePim;  // per core: does its traffic take the PIM path? (sys.cores.<group>.pim, default sim.pimMode)
     uint32_t lineSize;
+
+    // SynCron (HPCA'21): one Synchronization Engine per NDP unit, driven by the req_sync/req_async magic ops.
+    syncron::SyncronSystem* syncron;
+
+    // Uncached window (virtual byte addresses, registered by the app with ZSIM_MAGIC_OP_UNCACHED_REGION).
+    // Accesses inside it are never served by a cache: they go to memory every time, and no directory
+    // state is kept for them. This is how an incoherent host<->PIM DRAM mailbox behaves.
+    volatile uint64_t uncachedLo;
+    volatile uint64_t uncachedHi;
 
 
     //Cores

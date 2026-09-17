@@ -43,7 +43,7 @@ Ramulator2::Ramulator2(const std::string& configFile, unsigned numCores, unsigne
     else panic("[RAMULATOR2] sys.mem.clockMode must be \"r1\" or \"ns\", got %s", clockMode.c_str());
     cpuNs = 1e3 / cpuFreqMHz;
     memNs = r2_get_tck_ns(sim);
-    reqFlags = pimMode ? R2_FLAG_PIM : 0;
+    reqFlags = pimMode ? R2_FLAG_PIM : 0;  // fallback when no per-core flags exist
 
     sizeBytes = std::min<int>(lineSize, r2_get_tx_bytes(sim));
     info("[RAMULATOR2] %s: tCK %.3f ns, cpu %.3f ns, clock %s, %u cores, request size %d bytes", configFile.c_str(),
@@ -101,7 +101,10 @@ uint64_t Ramulator2::access(MemReq& req) {
 
 bool Ramulator2::trySend(Ramulator2AccEvent* ev) {
     ev->hold();
-    int ok = r2_send_ex(sim, ev->isWrite() ? R2_WRITE : R2_READ, ev->getAddr(), ev->getCoreId(), sizeBytes, reqFlags,
+    uint32_t flags = (zinfo->corePim && ev->getCoreId() < zinfo->numCores)
+                         ? (zinfo->corePim[ev->getCoreId()] ? R2_FLAG_PIM : 0u)
+                         : reqFlags;
+    int ok = r2_send_ex(sim, ev->isWrite() ? R2_WRITE : R2_READ, ev->getAddr(), ev->getCoreId(), sizeBytes, flags,
                         reinterpret_cast<uint64_t>(ev), &Ramulator2::onComplete, this);
     if (ok < 0) panic("[RAMULATOR2] send failed: %s", r2_last_error());
     if (!ok) ev->release();
