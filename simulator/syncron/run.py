@@ -5,6 +5,7 @@
   run.py --workload barrier --syncron --scheme syncron            # S4/S6 barrier, 15 clients/unit across units
   run.py --workload barrier --syncron --schemes syncron,ideal,central,hier   # S6: the paper's four systems
   run.py --workload barrier --syncron --scope unit --groups 8 --st-list 64,8,4,2   # S5: drive the ST into overflow
+  run.py --workload barrier --syncron --mode units --link-list 40,100,200,300,500  # S7: inter-unit link latency
   run.py --collect                                                # rebuild summary.csv
 
 Machine (Table 5, HBM): `--units` NDP units x `--cores-per-unit` in-order cores at `--mhz` (2000 per the user's
@@ -125,7 +126,8 @@ WORKLOADS = {
     # them are participants and leaves core 0 of each unit for a software server (Central/Hier) or idle.
     "barrier": ("../workloads/syncron/barrier --scheme {scheme} --scope {mode} "
                 "--clients-per-unit {clients_per_unit} --units-used {units_used} --groups {groups} "
-                "--rounds {iters} --units {units} --cores-per-unit {cores_per_unit} --stack-mb {stack_mb}"),
+                "--rounds {iters} --warmup {warmup} --units {units} --cores-per-unit {cores_per_unit} "
+                "--stack-mb {stack_mb}"),
 }
 
 # The Synchronization Engine (Table 5). Only added to the config when --syncron is given.
@@ -139,7 +141,9 @@ SYNCRON_BLOCK = """
         spuMHz = 1000;               // Table 5
         serviceCycles = 12;          // Table 5: SPU cycles per message
         localMsgCycles = {local_msg};    // core <-> local SE, one way
-        globalMsgCycles = {global_msg};  // local SE <-> Master SE, one way (40 ns)
+        globalMsgCycles = {global_msg};  // inter-unit link traversal, one way (Table 5: 40 ns)
+        linkBwGbps = {link_bw};          // Table 5: 12.8 GB/s per direction -- messages occupy the link
+        msgBytes = 18;                   // Sec 4.2: 64-bit addr + 6-bit opcode + 6-bit core id + 64-bit info
         bytesPerUnit = {bytes_per_unit}L;
         // Sec 4.4 overflow: one syncronVar access, in core cycles. Measured on this machine model (the S2 chase run
         // reports pim_latency/pim_requests = 29.4 memory ticks = 58.8 ns = 118 core cycles at 2 GHz).
@@ -154,6 +158,8 @@ NAME_PATTERNS = [
                                                           units_used=int(m.group(2)))),
     (re.compile(r"^g(\d+)$"), lambda m, r: r.update(groups=int(m.group(1)))),
     (re.compile(r"^st(\d+)$"), lambda m, r: r.update(st_entries=int(m.group(1)))),
+    (re.compile(r"^l(\d+)$"), lambda m, r: r.update(link_ns=int(m.group(1)))),
+    (re.compile(r"^w(\d+)$"), lambda m, r: r.update(warmup=int(m.group(1)))),
     (re.compile(r"^p(\d+)$"), lambda m, r: r.update(phase=int(m.group(1)))),
     (re.compile(r"^f(\d+)$"), lambda m, r: r.update(mhz=int(m.group(1)))),
     (re.compile(r"^(timing|ooo)$"), lambda m, r: r.update(core=m.group(1))),
@@ -165,14 +171,15 @@ SYNCRON_STATS = ("reqSync", "reqAsync", "barrierPolls", "localMsgs", "globalMsgs
                  "barriers", "barrierParticipants", "barrierReleaseCycles", "barrierSpanCycles", "barrierSkewCycles",
                  "stPeakEntries", "arrivals", "overflowMsgs", "overflowBarriers", "overflowAliased",
                  "overflowMemAccesses", "overflowMemCycles", "stFullEvents", "indexingCounterPeak", "swMsgs",
-                 "swGlobalMsgs", "swMsgsReceived", "swRecvEmpty", "swMsgWaitCycles")
+                 "swGlobalMsgs", "swMsgsReceived", "swRecvEmpty", "swMsgWaitCycles", "linkMsgs", "linkBytes",
+                 "linkQueueCycles", "linkMaxQueue")
 
 
 def name_of(a):
     parts = [f"{a.workload}_{a.mode if a.workload in ('probe', 'barrier') else 'se'}"]
     if a.workload == "barrier":
         parts += [a.scheme, f"u{a.units}x{a.cores_per_unit}", f"c{a.clients_per_unit}x{a.units_used}",
-                  f"g{a.groups}", f"st{a.st_entries}"]
+                  f"g{a.groups}", f"st{a.st_entries}", f"l{a.link_ns}", f"w{a.warmup}"]
     else:
         parts += [f"u{a.units}x{a.cores_per_unit}", f"t{a.threads}"]
     parts += [f"p{a.phase}", f"f{int(a.mhz)}", a.core.lower()]
@@ -181,6 +188,25 @@ def name_of(a):
     if a.no_arena:
         parts.append("noarena")
     return "__".join(parts)
+
+
+def mem_config(a):
+    """The memory config for this run. The inter-unit link is ONE physical link, so its latency moves on both sides
+    together: the SE's and the software schemes' messages (globalMsgCycles) and the data that crosses units
+    (HBMStack's inter_unit_latency_ps). The base YAML is Table 5's 40 ns; other latencies get a patched copy."""
+    if a.link_ns == 40:
+        return a.mem
+    base = SIM / a.mem
+    text = base.read_text()
+    key = "inter_unit_latency_ps: 40000"
+    if key not in text:
+        sys.exit(f"{base}: expected '{key}' to patch the link latency")
+    out = base.with_name(f"{base.stem}__l{a.link_ns}.yaml")
+    patched = text.replace(key, f"inter_unit_latency_ps: {a.link_ns * 1000}")
+    # Several sweeps may run at once: never rewrite a file another run could be reading.
+    if not out.exists() or out.read_text() != patched:
+        out.write_text(patched)
+    return str(out.relative_to(SIM))
 
 
 def write_cfg(a):
@@ -194,14 +220,15 @@ def write_cfg(a):
     cmd = WORKLOADS[a.workload].format(threads=a.threads, mode=a.mode, kb=a.kb, iters=a.iters, units=a.units,
                                        cores_per_unit=a.cores_per_unit, stack_mb=a.stack_mb, scheme=a.scheme,
                                        clients_per_unit=a.clients_per_unit, units_used=a.units_used,
-                                       groups=a.groups, arena=" --no-arena" if a.no_arena else "")
+                                       groups=a.groups, warmup=a.warmup, arena=" --no-arena" if a.no_arena else "")
     network_block = ("" if a.no_network else
                      f'    networkType = "mesh";\n    networkFile = "syncron/{a.netfile}";\n')
-    # Table 5's 40 ns inter-unit traversal and 1-cycle-arb + 1-cycle-hop crossbar, in core cycles.
-    global_msg = int(round(40e-9 * a.mhz * 1e6))
+    # The inter-unit traversal (Table 5: 40 ns) in core cycles; the crossbar's 1-cycle-arb + 1-cycle-hop is local_msg.
+    global_msg = int(round(a.link_ns * 1e-9 * a.mhz * 1e6))
     syncron_block = ("" if not a.syncron else
                      SYNCRON_BLOCK.format(scheme=a.scheme, units=a.units, cores_per_unit=a.cores_per_unit,
                                           local_msg=2, global_msg=global_msg, st_entries=a.st_entries,
+                                          link_bw=f"{a.link_bw_gbps:.2f}",
                                           overflow_mem=a.overflow_mem_cycles,
                                           bytes_per_unit=a.stack_mb * 1024 * 1024))
     # The template caps runs at 1e9 instructions; keep the knob, because "equal-instruction windows" is the planned
@@ -210,7 +237,8 @@ def write_cfg(a):
                  f"    maxTotalInstrs = {a.max_instrs}L;\n    maxOffloadInstrs = {a.max_instrs}L;\n")
     cfg = CFG.format(mhz=int(a.mhz), network_block=network_block, instr_cap=instr_cap,
                      syncron_block=syncron_block, cores_blocks=cores_blocks, l1_blocks=l1_blocks,
-                     units=a.units, llc_children=llc_children, mem=a.mem, stats=stats, phase=a.phase, cmd=cmd)
+                     units=a.units, llc_children=llc_children, mem=mem_config(a), stats=stats, phase=a.phase,
+                     cmd=cmd)
     path = HERE / "configs" / f"{name}.cfg"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(cfg)
@@ -350,6 +378,16 @@ def main():
                     help="independent barriers at once: per unit for --mode unit, in total for --mode units")
     ap.add_argument("--st-entries", type=int, default=64, help="Synchronization Table entries (Table 5: 64)")
     ap.add_argument("--st-list", default="", help="comma-separated ST sizes to sweep (the overflow experiment)")
+    ap.add_argument("--warmup", type=int, default=50,
+                    help="barrier rounds discarded before measuring. zsim's weave phase lands the latency of the "
+                         "start-up misses on the core clocks with a lag, inside the first rounds, and the size of that "
+                         "transient scales with link latency: Ideal at 500 ns reads 1100 cycles after 10 warm-up "
+                         "rounds and 134 after 30, against a floor of one phase")
+    ap.add_argument("--link-ns", type=int, default=40,
+                    help="inter-unit link latency (Table 5: 40 ns); moves the message and the data side together")
+    ap.add_argument("--link-list", default="", help="comma-separated link latencies to sweep (Fig 16: 40 -> 500 ns)")
+    ap.add_argument("--link-bw-gbps", type=float, default=12.8, help="inter-unit link bandwidth per direction")
+    ap.add_argument("--cpu-list", default="", help="comma-separated --clients-per-unit values to sweep")
     ap.add_argument("--overflow-mem-cycles", type=int, default=118,
                     help="core cycles for one syncronVar access by a Master SE in overflow mode")
     ap.add_argument("--max-instrs", type=int, default=0,
@@ -364,15 +402,23 @@ def main():
         phases = [int(x) for x in a.phases.split(",")] if a.phases else [a.phase]
         schemes = [x for x in a.schemes.split(",")] if a.schemes else [a.scheme]
         sts = [int(x) for x in a.st_list.split(",")] if a.st_list else [a.st_entries]
+        links = [int(x) for x in a.link_list.split(",")] if a.link_list else [a.link_ns]
+        cpus = [int(x) for x in a.cpu_list.split(",")] if a.cpu_list else [a.clients_per_unit]
         for phase in phases:
-            for scheme in schemes:
-                for st in sts:
-                    a.phase, a.scheme, a.st_entries = phase, scheme, st
-                    if a.dry_run:
-                        print(write_cfg(a)[1])
-                        continue
-                    name, rc, wall, _ = launch(a)
-                    print(f"rc={rc} wall={wall:.0f}s {name}", flush=True)
+            for link in links:
+                for cpu in cpus:
+                    for scheme in schemes:
+                        # Central and Hier need core 0 of each unit for their server.
+                        if scheme in ("central", "hier") and cpu >= a.cores_per_unit:
+                            continue
+                        for st in sts:
+                            a.phase, a.link_ns, a.clients_per_unit, a.scheme, a.st_entries = \
+                                phase, link, cpu, scheme, st
+                            if a.dry_run:
+                                print(write_cfg(a)[1])
+                                continue
+                            name, rc, wall, _ = launch(a)
+                            print(f"rc={rc} wall={wall:.0f}s {name}", flush=True)
 
     names = sorted(p.stem for p in (SIM / "zsim_stats" / "syncron" / "logs").glob("*.log"))
     rows = [summarise(n) for n in names]

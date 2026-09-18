@@ -12,6 +12,10 @@ SyncronSystem::SyncronSystem(const Params& params, uint32_t core_freq_mhz, uint3
     service_core_cycles = (uint32_t)((uint64_t)p.service_cycles * core_freq_mhz / p.spu_mhz);
     if (!service_core_cycles) service_core_cycles = 1;
     overflow_mem_core_cycles = p.overflow_mem_cycles;
+    // bytes / (GB/s) = ns; ns * MHz / 1000 = core cycles. At least one cycle: a message is never free to send.
+    double occ_ns = p.msg_bytes / p.link_bw_gbps;
+    link_occupancy_cycles = (uint32_t)((occ_ns * core_freq_mhz / 1000.0) + 0.999999);
+    if (!link_occupancy_cycles) link_occupancy_cycles = 1;
     if (p.cores_per_unit > 64) panic("[SYNCRON] a local waiting list is one bit per core: %u > 64", p.cores_per_unit);
     if (p.units > 64) panic("[SYNCRON] a global waiting list is one bit per SE: %u > 64", p.units);
     if (p.scheme >= SCHEME_COUNT) panic("[SYNCRON] unknown scheme %u", p.scheme);
@@ -22,12 +26,14 @@ SyncronSystem::SyncronSystem(const Params& params, uint32_t core_freq_mhz, uint3
     }
     release_of_core.resize(num_cores, 0);
     inbox.resize(num_cores);
+    link_free.resize((size_t)p.units * p.units, 0);
     futex_init(&lock);
     info("[SYNCRON] scheme %s, %u units x %u cores, SPU %u MHz x %u cycles = %u core cycles/message, "
-         "core<->SE %u cyc, SE<->SE %u cyc, ST %u entries, %u counters, overflow access %u cyc, %lu MB per unit",
+         "core<->SE %u cyc, link %u cyc + %u B at %.1f GB/s = %u cyc occupancy, ST %u entries, %u counters, "
+         "overflow access %u cyc, %lu MB per unit",
          scheme_name(p.scheme), p.units, p.cores_per_unit, p.spu_mhz, p.service_cycles, service_core_cycles,
-         p.local_msg_cycles, p.global_msg_cycles, p.st_entries, p.indexing_counters, overflow_mem_core_cycles,
-         p.bytes_per_unit >> 20);
+         p.local_msg_cycles, p.global_msg_cycles, p.msg_bytes, p.link_bw_gbps, link_occupancy_cycles, p.st_entries,
+         p.indexing_counters, overflow_mem_core_cycles, p.bytes_per_unit >> 20);
 }
 
 uint64_t SyncronSystem::serve(uint32_t unit, uint64_t arrival, uint32_t extra_cycles) {
@@ -38,6 +44,18 @@ uint64_t SyncronSystem::serve(uint32_t unit, uint64_t arrival, uint32_t extra_cy
     e.spu_free = start + service_core_cycles + extra_cycles;
     s_msgs_per_unit.inc(unit);
     return e.spu_free;
+}
+
+uint64_t SyncronSystem::crossLink(uint32_t src_unit, uint32_t dst_unit, uint64_t depart) {
+    size_t dir = (size_t)src_unit * p.units + dst_unit;
+    uint64_t ready = MAX(depart, link_free[dir]);
+    link_free[dir] = ready + link_occupancy_cycles;
+    uint64_t wait = ready - depart;
+    s_link_msgs.inc();
+    s_link_bytes.inc(p.msg_bytes);
+    s_link_queue_cycles.inc(wait);
+    if (wait > s_link_max_queue.get()) s_link_max_queue.set(wait);
+    return ready + p.global_msg_cycles;
 }
 
 /* Reserve an ST entry. False means the table is full, which is Sec 4.4's overflow condition -- not an error. */
@@ -122,7 +140,7 @@ uint64_t SyncronSystem::barrierArrive(uint32_t core_id, uint64_t addr, bool acro
         // Core -> its local SE, which redirects to the Master SE (Sec 4.3); both SPUs serve the message.
         served = serve(unit, now + p.local_msg_cycles);
         s_local_msgs.inc();
-        served = serve(coord, served + p.global_msg_cycles, extra);
+        served = serve(coord, crossLink(unit, coord, served), extra);
         s_global_msgs.inc();
     }
 
@@ -200,7 +218,7 @@ void SyncronSystem::releaseBarrier(uint32_t coord_unit, uint64_t addr, bool acro
         uint64_t release;
         if (across_units && unit != coord_unit) {
             // ... to the participant's local SE over the inter-unit link, which then serves its own departure.
-            uint64_t at_local = serve(unit, sent + p.global_msg_cycles);
+            uint64_t at_local = serve(unit, crossLink(coord_unit, unit, sent));
             s_global_msgs.inc();
             release = at_local + p.local_msg_cycles;
         } else {
@@ -231,13 +249,15 @@ void SyncronSystem::msgSend(uint32_t src_core, uint32_t dst_core, uint64_t tag, 
     if (dst_core >= num_cores) panic("[SYNCRON] message to core %u, which does not exist", dst_core);
     if (tag > MSG_TAG_MASK) panic("[SYNCRON] message tag 0x%lx does not fit in 48 bits", tag);
     futex_lock(&lock);
-    bool remote = unitOfCore(src_core) != unitOfCore(dst_core);
+    uint32_t su = unitOfCore(src_core), du = unitOfCore(dst_core);
+    bool remote = su != du;
     Msg m;
     m.src_core = src_core;
     m.tag = tag;
-    // The same per-hop costs the SE's own messages pay: the unit's crossbar, plus Table 5's inter-unit link when the
-    // server is in another unit.
-    m.arrive = now + p.local_msg_cycles + (remote ? p.global_msg_cycles : 0);
+    // The same costs the SE's own messages pay: the unit's crossbar, plus the inter-unit link -- the same links,
+    // with the same occupancy -- when the server is in another unit.
+    m.arrive = now + p.local_msg_cycles;
+    if (remote) m.arrive = crossLink(su, du, m.arrive);
     inbox[dst_core].push_back(m);
     s_sw_msgs.inc();
     if (remote) s_sw_global_msgs.inc();
@@ -397,6 +417,12 @@ void SyncronSystem::initStats(AggregateStat* parent) {
     st->append(&s_sw_recv_empty);
     s_sw_msg_wait_cycles.init("swMsgWaitCycles", "cycles a server waited for a message that was still in flight");
     st->append(&s_sw_msg_wait_cycles);
+    s_link_msgs.init("linkMsgs", "messages that crossed an inter-unit link (SE and software)"); st->append(&s_link_msgs);
+    s_link_bytes.init("linkBytes", "bytes those messages put on the links"); st->append(&s_link_bytes);
+    s_link_queue_cycles.init("linkQueueCycles", "cycles messages waited for a busy link"); st->append(&s_link_queue_cycles);
+    s_link_max_queue.init("linkMaxQueue", "longest single wait for a link (a large value flags bound-phase ordering, "
+                                          "since legitimate queueing is a few occupancy slots)");
+    st->append(&s_link_max_queue);
     s_msgs_per_unit.init("msgsPerUnit", "messages served, per NDP unit", p.units); st->append(&s_msgs_per_unit);
     s_msgs_per_opcode.init("msgsPerOpcode", "messages issued, per opcode", OP_COUNT); st->append(&s_msgs_per_opcode);
     s_barriers_per_unit.init("barriersPerUnit", "barriers coordinated, per NDP unit", p.units);

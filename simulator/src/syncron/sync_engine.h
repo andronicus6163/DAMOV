@@ -11,7 +11,15 @@
  *   - `indexing_counters` counters indexed by the address's least significant bits (Table 5: 256). A counter above
  *     zero means "this variable is currently serviced through main memory" -- Sec 4.4's overflow mode, below.
  *   - core <-> local SE: `local_msg_cycles` each way (the compute die's crossbar).
- *     local SE <-> Master SE: `global_msg_cycles` each way (Table 5's inter-unit link, 40 ns).
+ *     local SE <-> Master SE: over Table 5's inter-unit links -- "serial interconnection links", one per direction
+ *     between each pair of units, "12.8 GB/s per direction; 40 ns per cache line". A message takes the link for
+ *     `msg_bytes` at `link_bw_gbps` (occupancy, so messages on the same link queue) and arrives
+ *     `global_msg_cycles` after it got on. Sec 4.2's message is a 64-bit address, a 6-bit opcode, a 6-bit core id
+ *     and a 64-bit MessageInfo = 140 bits = 18 bytes. The software baselines' messages use the same links, as the
+ *     paper says they do.
+ *     NOT shared with data: the memory model has its own copy of the same links (HBMStack `inter_unit = link`), in
+ *     memory ticks and in the weave phase, and the two cannot be one occupancy state across zsim's phases. So
+ *     messages queue behind messages and data behind data, but not one behind the other.
  *   - a variable's Master SE is the unit whose memory holds it: (address / bytes_per_unit) % units, the same rule the
  *     memory model uses for unit-major addressing.
  *   - barrier_wait_within_unit: the local SE counts its own cores and releases them (no global traffic).
@@ -100,7 +108,9 @@ struct Params {
     uint32_t spu_mhz = 1000;           // Table 5
     uint32_t service_cycles = 12;      // Table 5: SPU cycles per message
     uint32_t local_msg_cycles = 2;     // core <-> local SE, one way, in core cycles
-    uint32_t global_msg_cycles = 80;   // local SE <-> Master SE, one way (40 ns at 2 GHz)
+    uint32_t global_msg_cycles = 80;   // inter-unit link traversal, one way (Table 5: 40 ns = 80 cycles at 2 GHz)
+    double link_bw_gbps = 12.8;        // Table 5: per direction
+    uint32_t msg_bytes = 18;           // Sec 4.2: 64 + 6 + 6 + 64 bits = 140 bits
     uint64_t bytes_per_unit = 1ull << 30;
     // Sec 4.4 overflow: one syncronVar access costs this much SPU time. Measured on this machine model, not invented:
     // the S2 pointer-chase run reports pim_latency/pim_requests = 29.4 memory ticks = 58.8 ns = 118 core cycles at
@@ -174,6 +184,10 @@ class SyncronSystem : public GlobAlloc {
     };
 
     uint64_t serve(uint32_t unit, uint64_t arrival, uint32_t extra_cycles = 0);  // occupy a unit's SPU
+    /* One message over the src -> dst link, getting on at `depart`. Returns when it arrives at dst. The same rule as
+     * the memory model's link: it waits for the link to be free, occupies it for its size, and arrives one traversal
+     * after it got on. */
+    uint64_t crossLink(uint32_t src_unit, uint32_t dst_unit, uint64_t depart);
     uint32_t counterIdx(uint64_t addr) const { return (uint32_t)((addr >> 6) % p.indexing_counters); }
     bool stAlloc(uint32_t unit, uint64_t addr);  // false = no entry: the variable goes to memory mode (Sec 4.4)
     void stFree(uint32_t unit, uint64_t addr);
@@ -184,6 +198,8 @@ class SyncronSystem : public GlobAlloc {
     Params p;
     uint32_t service_core_cycles;
     uint32_t overflow_mem_core_cycles;
+    uint32_t link_occupancy_cycles;     // one message on one link, in core cycles
+    g_vector<uint64_t> link_free;       // [src_unit * units + dst_unit]: when that direction is free again
     uint32_t num_cores;
     g_vector<Engine> engines;
     g_vector<uint64_t> release_of_core;  // 0 = nothing decided yet
@@ -195,7 +211,8 @@ class SyncronSystem : public GlobAlloc {
         s_rejected_opcode, s_barriers, s_barrier_participants, s_barrier_release_cycles, s_barrier_span_cycles,
         s_barrier_skew_cycles, s_st_peak, s_arrivals, s_overflow_msgs, s_overflow_barriers, s_overflow_aliased,
         s_overflow_mem_accesses, s_overflow_mem_cycles, s_st_full_events, s_counter_peak, s_sw_msgs,
-        s_sw_global_msgs, s_sw_recv, s_sw_recv_empty, s_sw_msg_wait_cycles;
+        s_sw_global_msgs, s_sw_recv, s_sw_recv_empty, s_sw_msg_wait_cycles, s_link_msgs, s_link_bytes,
+        s_link_queue_cycles, s_link_max_queue;
     VectorCounter s_msgs_per_unit, s_msgs_per_opcode, s_barriers_per_unit;
 };
 

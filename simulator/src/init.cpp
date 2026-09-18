@@ -1044,6 +1044,8 @@ void SimInit(const char* configFile, const char* outputDir, uint32_t shmid) {
         sp.local_msg_cycles = config.get<uint32_t>("sys.syncron.localMsgCycles", 2);
         sp.global_msg_cycles = config.get<uint32_t>("sys.syncron.globalMsgCycles", 80);
         sp.bytes_per_unit = config.get<uint64_t>("sys.syncron.bytesPerUnit", 1ull << 30);
+        sp.link_bw_gbps = config.get<double>("sys.syncron.linkBwGbps", 12.8);
+        sp.msg_bytes = config.get<uint32_t>("sys.syncron.msgBytes", 18);
         sp.overflow_mem_cycles = config.get<uint32_t>("sys.syncron.overflowMemCycles", 118);
         sp.overflow_arrive_accesses = config.get<uint32_t>("sys.syncron.overflowArriveAccesses", 2);
         sp.overflow_release_accesses = config.get<uint32_t>("sys.syncron.overflowReleaseAccesses", 2);
