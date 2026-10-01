@@ -1250,6 +1250,11 @@ bool Decoder::decodeInstr(INS ins, DynUopVec& uops) {
 
     //Add ld/st fence to all locked instructions
     if (isLocked) {
+        // A locked read-modify-write reads its line for ownership (one RFO), as x86 does, instead of a shared read
+        // followed by an upgrade: otherwise every atomic is two coherence transactions.
+        for (uint32_t i = initialUops; i < uops.size(); i++) {
+            if (uops[i].type == UOP_LOAD) uops[i].pad |= UOP_FLAG_RFO;
+        }
         //inaccurate = true; //this is now fairly accurate
         emitFence(uops, 9); //locked ops introduce an additional uop and cache locking takes 14 cycles/instr per the perf counters; latencies match with 9 cycles of fence latency
     }

@@ -80,6 +80,7 @@
 #include "virt/port_virtualizer.h"
 #include "weave_md1_mem.h"
 #include "syncron/sync_engine.h"
+#include "cluster_net.h"
 #include "zsim.h"
 
 std::string application_path;
@@ -280,7 +281,10 @@ BaseCache* BuildCacheBank(Config& config, const string& prefix, g_string& name, 
     if (isTerminal) {
         cc = new MESITerminalCC(numLines, bypass, name);
     } else {
-        cc = new MESICC(numLines, nonInclusiveHack, bypass, name);
+        MESICC* mcc = new MESICC(numLines, nonInclusiveHack, bypass, name);
+        // Blocking directory: serialize transfers of one line between children (coherence_ctrls.h). Off by default.
+        mcc->setSerializeTransfers(config.get<bool>(prefix + "serializeTransfers", false), accLat);
+        cc = mcc;
     }
     rp->setCC(cc);
     if (!isTerminal) {
@@ -534,8 +538,10 @@ static void InitSystem(Config& config) {
         for (auto& childVec : childMap[group]) fringe.insert(fringe.end(), childVec.begin(), childVec.end());
     }
 
-    //Check single LLC
-    if (cMap[llc]->size() != 1) panic("Last-level cache %s must have caches = 1, but %ld were specified", llc.c_str(), cMap[llc]->size());
+    // Several caches in the LLC group are allowed: each serves its own share of the children (e.g. one L3 per
+    // processor of a cluster) and talks to memory directly. There is no directory above them, so they are NOT coherent
+    // with each other -- right for separate processors, wrong for anything that shares data across them.
+    if (cMap[llc]->size() != 1) info("Last-level cache %s has %ld caches, not coherent with each other", llc.c_str(), cMap[llc]->size());
 
     /* Since we have checked for no loops, parent is mandatory, and all parents are checked valid,
      * it follows that we have a fully connected tree finishing at the LLC.
@@ -569,10 +575,12 @@ static void InitSystem(Config& config) {
     //Connect everything
     bool printHierarchy = config.get<bool>("sim.printHierarchy", false);
 
-    // mem to llc is a bit special, only one llc
+    // mem to llc is a bit special, only one llc group. The group may hold several caches (e.g. one L3 per processor
+    // of a cluster, each serving its own share of the L2s); every one of them talks to memory. Memory keeps no
+    // sharer state, so the child ids only need to be distinct.
     uint32_t childId = 0;
-    for (BaseCache* llcBank : (*cMap[llc])[0]) {
-        llcBank->setParents(childId++, mems, network);
+    for (vector<BaseCache*>& llcCache : *cMap[llc]) {
+        for (BaseCache* llcBank : llcCache) llcBank->setParents(childId++, mems, network);
     }
 
     // Rest of caches
@@ -1045,6 +1053,9 @@ void SimInit(const char* configFile, const char* outputDir, uint32_t shmid) {
         sp.global_msg_cycles = config.get<uint32_t>("sys.syncron.globalMsgCycles", 80);
         sp.bytes_per_unit = config.get<uint64_t>("sys.syncron.bytesPerUnit", 1ull << 30);
         sp.link_bw_gbps = config.get<double>("sys.syncron.linkBwGbps", 12.8);
+        sp.mesh_x = config.get<uint32_t>("sys.syncron.meshX", 0);
+        sp.trace_from = config.get<uint32_t>("sys.syncron.traceFrom", 0);
+        sp.trace_count = config.get<uint32_t>("sys.syncron.traceCount", 0);
         sp.msg_bytes = config.get<uint32_t>("sys.syncron.msgBytes", 18);
         sp.overflow_mem_cycles = config.get<uint32_t>("sys.syncron.overflowMemCycles", 118);
         sp.overflow_arrive_accesses = config.get<uint32_t>("sys.syncron.overflowArriveAccesses", 2);
@@ -1061,6 +1072,21 @@ void SimInit(const char* configFile, const char* outputDir, uint32_t shmid) {
         }
         zinfo->syncron = new syncron::SyncronSystem(sp, zinfo->freqMHz, zinfo->numCores);
         zinfo->syncron->initStats(zinfo->rootStat);
+    }
+
+    // Cluster network between processors (cluster_net.h). Absent sys.cluster.nodes, there is none, and
+    // net_send/net_recv panic if the application uses them.
+    zinfo->cluster = nullptr;
+    uint32_t clusterNodes = config.get<uint32_t>("sys.cluster.nodes", 0);
+    if (clusterNodes) {
+        ClusterNetParams cp;
+        cp.nodes = clusterNodes;
+        cp.cores_per_node = config.get<uint32_t>("sys.cluster.coresPerNode", zinfo->numCores / clusterNodes);
+        cp.latency_ns = config.get<double>("sys.cluster.latencyNs", 1000.0);
+        cp.bw_gbps = config.get<double>("sys.cluster.bwGBps", 12.5);
+        cp.msg_bytes = config.get<uint32_t>("sys.cluster.msgBytes", 64);
+        zinfo->cluster = new ClusterNet(cp, zinfo->freqMHz, zinfo->numCores);
+        zinfo->cluster->initStats(zinfo->rootStat);
     }
 
     //Sched stats (deferred because of circular deps)

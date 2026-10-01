@@ -22,7 +22,15 @@ File format (MeshNetworkMD1):
 The parser registers BOTH directions of every line it reads (and asserts if either is already present), so each pair
 appears exactly once here -- the L1 -> LLC miss path and the LLC -> L1 invalidation path are the same entry.
 
-  gen_network.py --units 4 --cores-per-unit 16 > network_4x16.mesh
+  gen_network.py --units 4 --cores-per-unit 16 > network_4x16.mesh                        # S1-S9
+  gen_network.py --units 128 --cores-per-unit 16 --crossbar per-unit > network_128x16_unit.mesh
+
+`--crossbar line` (the S1-S9 files) routes each L1 miss to whichever LLC bank zsim's hash picks, across a line of
+unit routers -- so a miss can walk other units' crossbars, and a remote address pays that walk on top of the memory
+model's inter-unit link. S1 measured it at 11.6 cycles per miss against 4 for a local one. At 4 units that is a small
+double count; at 128 units the line is 128 routers long. `--crossbar per-unit` makes the crossbar what Table 5 says:
+every L1 reaches the (bypassed) LLC through its OWN unit's router, whichever bank the hash picks, and everything
+between units is the memory model's links (HBMStack `inter_unit`), which is where the unit network is modelled.
 """
 import argparse
 import sys
@@ -34,6 +42,8 @@ def main():
     ap.add_argument("--cores-per-unit", type=int, default=16)
     ap.add_argument("--hop-delay", type=int, default=2, help="cycles per traversal: 1 arbitration + 1 hop (Table 5)")
     ap.add_argument("--llc", default="llc", help="LLC cache-group name (one bank per unit)")
+    ap.add_argument("--crossbar", choices=["line", "per-unit"], default="line",
+                    help="line = the S1-S9 layout; per-unit = every L1 uses only its own unit's router")
     a = ap.parse_args()
 
     out = [f"{a.units} 2 {a.hop_delay}"]
@@ -44,7 +54,8 @@ def main():
     for u in range(a.units):
         for l1 in l1s[u]:
             for b in range(a.units):
-                out.append(f"{l1} {banks[b]} 1 {u} 0 {b} 0")      # both directions, see above
+                dst = b if a.crossbar == "line" else u               # per-unit: bank b is reached via unit u's router
+                out.append(f"{l1} {banks[b]} 1 {u} 0 {dst} 0")    # both directions, see above
     for u in range(a.units):
         out.append(f"{banks[u]} mem-0 0 0")                       # the bypassed LLC never queries this; present so
                                                                   # a stray lookup cannot panic

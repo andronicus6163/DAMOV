@@ -460,6 +460,10 @@ class OOOCore : public Core {
         uint64_t getOffloadInstrs() const;
         uint64_t getPhaseCycles() const;
         uint64_t getCycles() const {return cRec.getUnhaltedCycles(curCycle);}
+        // For magic ops that stall the core (a message still in flight, a park to the phase end), as TimingCore has.
+        uint64_t getCurCycle() const override {return curCycle;}
+        uint64_t getPhaseEnd() const override {return phaseEndCycle;}
+        void idleUntil(uint64_t cycle) override;
 
         void initStats(AggregateStat* parentStat);
         void contextSwitch(int32_t gid);

@@ -1,5 +1,8 @@
 #include "syncron/sync_engine.h"
 
+#include <stdarg.h>
+#include <stdio.h>
+
 #include "bithacks.h"
 #include "log.h"
 #include "zsim.h"
@@ -17,7 +20,7 @@ SyncronSystem::SyncronSystem(const Params& params, uint32_t core_freq_mhz, uint3
     link_occupancy_cycles = (uint32_t)((occ_ns * core_freq_mhz / 1000.0) + 0.999999);
     if (!link_occupancy_cycles) link_occupancy_cycles = 1;
     if (p.cores_per_unit > 64) panic("[SYNCRON] a local waiting list is one bit per core: %u > 64", p.cores_per_unit);
-    if (p.units > 64) panic("[SYNCRON] a global waiting list is one bit per SE: %u > 64", p.units);
+    if (p.mesh_x && p.units % p.mesh_x) panic("[SYNCRON] a mesh %u units wide does not tile %u units", p.mesh_x, p.units);
     if (p.scheme >= SCHEME_COUNT) panic("[SYNCRON] unknown scheme %u", p.scheme);
     engines.resize(p.units);
     for (uint32_t u = 0; u < p.units; u++) {
@@ -38,6 +41,13 @@ SyncronSystem::SyncronSystem(const Params& params, uint32_t core_freq_mhz, uint3
 
 uint64_t SyncronSystem::serve(uint32_t unit, uint64_t arrival, uint32_t extra_cycles) {
     Engine& e = engines[unit];
+    // The SPU serves messages in the order the simulator's threads reach it, which inside a bound phase is not always
+    // simulated-arrival order. Count when it happens and by how much, instead of assuming it does not.
+    if (arrival < e.last_served_arrival) {
+        s_spu_inversions.inc();
+        s_spu_inversion_cycles.inc(e.last_served_arrival - arrival);
+    }
+    e.last_served_arrival = arrival;
     uint64_t start = MAX(arrival, e.spu_free);
     s_queue_cycles.inc(start - arrival);
     s_service_cycles.inc(service_core_cycles + extra_cycles);
@@ -47,15 +57,27 @@ uint64_t SyncronSystem::serve(uint32_t unit, uint64_t arrival, uint32_t extra_cy
 }
 
 uint64_t SyncronSystem::crossLink(uint32_t src_unit, uint32_t dst_unit, uint64_t depart) {
-    size_t dir = (size_t)src_unit * p.units + dst_unit;
-    uint64_t ready = MAX(depart, link_free[dir]);
-    link_free[dir] = ready + link_occupancy_cycles;
-    uint64_t wait = ready - depart;
+    uint64_t t = depart;
+    auto traverse = [&](uint32_t from, uint32_t to) {
+        size_t dir = (size_t)from * p.units + to;
+        uint64_t ready = MAX(t, link_free[dir]);
+        link_free[dir] = ready + link_occupancy_cycles;
+        uint64_t wait = ready - t;
+        s_link_hops.inc();
+        s_link_queue_cycles.inc(wait);
+        if (wait > s_link_max_queue.get()) s_link_max_queue.set(wait);
+        t = ready + p.global_msg_cycles;
+    };
+    if (!p.mesh_x) {
+        traverse(src_unit, dst_unit);
+    } else {
+        uint32_t w = p.mesh_x, x = src_unit % w, y = src_unit / w, dx = dst_unit % w, dy = dst_unit / w, cur = src_unit;
+        while (x != dx) { x = (dx > x) ? x + 1 : x - 1; uint32_t next = y * w + x; traverse(cur, next); cur = next; }
+        while (y != dy) { y = (dy > y) ? y + 1 : y - 1; uint32_t next = y * w + x; traverse(cur, next); cur = next; }
+    }
     s_link_msgs.inc();
     s_link_bytes.inc(p.msg_bytes);
-    s_link_queue_cycles.inc(wait);
-    if (wait > s_link_max_queue.get()) s_link_max_queue.set(wait);
-    return ready + p.global_msg_cycles;
+    return t;
 }
 
 /* Reserve an ST entry. False means the table is full, which is Sec 4.4's overflow condition -- not an error. */
@@ -87,22 +109,38 @@ void SyncronSystem::stFree(uint32_t unit, uint64_t addr) {
     }
 }
 
+void SyncronSystem::traceMsg(const char* fmt, ...) {
+    uint64_t b = s_barriers.get();
+    if (!p.trace_count || b < p.trace_from || b >= (uint64_t)p.trace_from + p.trace_count) return;
+    char buf[320];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    info("[SYNCRON-TRACE b=%lu] %s", b, buf);
+}
+
 /* One participant arrives. Returns its release cycle if this arrival completed the barrier and the caller is the
  * last participant, otherwise 0 (the caller polls). */
 uint64_t SyncronSystem::barrierArrive(uint32_t core_id, uint64_t addr, bool across_units, uint64_t now) {
     uint32_t unit = unitOfCore(core_id);
     uint32_t coord = across_units ? masterUnitOf(addr) : unit;
     s_arrivals.inc();
+    auto it = registered.find(addr);
+    if (it == registered.end()) {
+        panic("[SYNCRON] core %u waited on a barrier at 0x%lx that was never created (create_syncvar)", core_id, addr);
+    }
+    uint32_t participants = it->second;
+    // Sec 4.1.3: one-level only "if a smaller number of cores than the total available cores of the NDP system
+    // participate"; when all of them do, the SEs aggregate per unit.
+    if (across_units && participants == p.units * p.cores_per_unit) {
+        return barrierArriveTwoLevel(core_id, unit, coord, addr, participants, now);
+    }
 
     Engine& ce = engines[coord];
     BarrierState& b = ce.barriers[addr];
     if (!b.participants) {
-        auto it = registered.find(addr);
-        if (it == registered.end()) {
-            panic("[SYNCRON] core %u waited on a barrier at 0x%lx that was never created (create_syncvar)", core_id,
-                  addr);
-        }
-        b.participants = it->second;
+        b.participants = participants;
         // Sec 4.4. A counter above zero says some variable with these address LSBs is already being serviced through
         // main memory: this one joins it (the paper's counters cannot tell the two apart -- that is the design, and
         // `overflowAliased` counts how often it costs a variable that the ST had room for). Otherwise try the ST, and
@@ -131,32 +169,101 @@ uint64_t SyncronSystem::barrierArrive(uint32_t core_id, uint64_t addr, bool acro
         s_overflow_mem_cycles.inc(extra);
     }
 
+    const char* op = across_units ? "barrier_wait_local_across_units" : "barrier_wait_local_within_unit";
+    const char* mode = b.overflowed ? " [memory mode]" : "";
     uint64_t served;
     if (coord == unit) {
         // Core -> its local SE, which is also the coordinator.
         served = serve(unit, now + p.local_msg_cycles, extra);
         s_local_msgs.inc();
+        traceMsg("%s core %u -> SE%u: sent %lu, served %lu%s", op, core_id, unit, now, served, mode);
     } else {
-        // Core -> its local SE, which redirects to the Master SE (Sec 4.3); both SPUs serve the message.
-        served = serve(unit, now + p.local_msg_cycles);
+        // Core -> its local SE, which re-directs to the Master SE (Sec 4.1.3); both SPUs serve the message.
+        uint64_t at_local = serve(unit, now + p.local_msg_cycles);
         s_local_msgs.inc();
-        served = serve(coord, crossLink(unit, coord, served), extra);
+        uint64_t arrive = crossLink(unit, coord, at_local);
+        served = serve(coord, arrive, extra);
         s_global_msgs.inc();
+        traceMsg("%s core %u -> SE%u: sent %lu, served %lu -> re-directed to Master SE%u: link arrive %lu, served %lu%s",
+              op, core_id, unit, now, at_local, coord, arrive, served, mode);
     }
 
     if (!b.arrived) b.first_arrival = served;
     b.arrived++;
     b.last_arrival = MAX(b.last_arrival, served);
     if (unit == coord) b.local_list |= (1ull << (core_id % p.cores_per_unit));
-    b.global_list |= (1ull << unit);
+    if (b.global_list.empty()) b.global_list.resize(p.units, 0);
+    b.global_list[unit] = 1;
     b.waiter_core.push_back(core_id);
     b.waiter_served.push_back(served);
 
     if (b.arrived < b.participants) return 0;  // not everybody is here yet
+    traceMsg("SE%u: %u/%u arrived, complete at %lu", coord, b.arrived, b.participants, b.last_arrival);
     releaseBarrier(coord, addr, across_units);
     uint64_t mine = release_of_core[core_id];
     release_of_core[core_id] = 0;
     return mine;  // the last arriver learns its release cycle immediately
+}
+
+/* Two-level barrier: every core of the system participates (Sec 4.1.3). Each SE counts its own cores; when they are
+ * all in it sends one barrier_wait_global to the Master SE (the Master's own unit needs none). The Master completes
+ * the barrier when every unit has reported. */
+uint64_t SyncronSystem::barrierArriveTwoLevel(uint32_t core_id, uint32_t unit, uint32_t coord, uint64_t addr,
+                                              uint32_t participants, uint64_t now) {
+    Engine& le = engines[unit];
+    LocalBarrier& lb = le.local_barriers[addr];
+    if (!lb.count && (le.counters[counterIdx(addr)] > 0 || !stAlloc(unit, addr))) {
+        // Sec 4.4 re-directs an overflowed local SE's messages to the Master SE with overflow opcodes. A barrier that
+        // every core waits on is the only variable any core can be waiting on, so its ST cannot be full: the path is
+        // unreachable for barriers and is left out rather than modelled untested. Locks (S10) will need it.
+        panic("[SYNCRON] SE%u: no ST entry for the two-level barrier at 0x%lx (local-SE overflow is not modelled)",
+              unit, addr);
+    }
+    uint64_t served = serve(unit, now + p.local_msg_cycles);
+    s_local_msgs.inc();
+    if (!lb.count) lb.first = served;
+    lb.count++;
+    lb.last = MAX(lb.last, served);
+    lb.waiters.push_back(core_id);
+    traceMsg("barrier_wait_local_across_units core %u -> SE%u: sent %lu, served %lu (%u/%u of this unit)", core_id, unit,
+          now, served, lb.count, p.cores_per_unit);
+    if (lb.count < p.cores_per_unit) return 0;
+
+    uint64_t reported;
+    if (unit == coord) {
+        reported = lb.last;  // the Master SE is this unit's own SE: nothing to send
+        traceMsg("Master SE%u: its own %u cores are in at %lu", unit, p.cores_per_unit, reported);
+    } else {
+        uint64_t sent = serve(unit, lb.last);  // the local SE sends barrier_wait_global ...
+        uint64_t arrive = crossLink(unit, coord, sent);
+        reported = serve(coord, arrive);       // ... and the Master SE takes it
+        s_global_msgs.inc();
+        traceMsg("barrier_wait_global SE%u -> Master SE%u: sent %lu, link arrive %lu, served %lu", unit, coord, sent, arrive,
+              reported);
+    }
+
+    Engine& ce = engines[coord];
+    BarrierState& b = ce.barriers[addr];
+    if (!b.participants) {
+        b.participants = participants;
+        b.two_level = true;
+        b.first_arrival = lb.first;
+        if (!stAlloc(coord, addr)) {
+            panic("[SYNCRON] Master SE%u: no ST entry for the two-level barrier at 0x%lx", coord, addr);
+        }
+        s_two_level_barriers.inc();
+    }
+    b.first_arrival = MIN(b.first_arrival, lb.first);
+    b.arrived += lb.count;
+    if (b.global_list.empty()) b.global_list.resize(p.units, 0);
+    b.global_list[unit] = 1;
+    b.last_arrival = MAX(b.last_arrival, reported);
+    if (b.arrived < b.participants) return 0;
+    traceMsg("Master SE%u: every unit reported, complete at %lu", coord, b.last_arrival);
+    releaseTwoLevel(coord, addr);
+    uint64_t mine = release_of_core[core_id];
+    release_of_core[core_id] = 0;
+    return mine;
 }
 
 /* Ideal (Sec 6): zero performance overhead for synchronization. No message, no SPU, no ST -- every participant is
@@ -208,6 +315,8 @@ void SyncronSystem::releaseBarrier(uint32_t coord_unit, uint64_t addr, bool acro
         s_service_cycles.inc(cycles);
         s_overflow_mem_accesses.inc(p.overflow_release_accesses);
         s_overflow_mem_cycles.inc(cycles);
+        traceMsg("SE%u [memory mode]: reads the waiting lists from syncronVar, SPU busy %lu..%lu", coord_unit, start,
+              e.spu_free);
     }
     for (size_t i = 0; i < b.waiter_core.size(); i++) {
         uint32_t core = b.waiter_core[i];
@@ -218,31 +327,79 @@ void SyncronSystem::releaseBarrier(uint32_t coord_unit, uint64_t addr, bool acro
         uint64_t release;
         if (across_units && unit != coord_unit) {
             // ... to the participant's local SE over the inter-unit link, which then serves its own departure.
-            uint64_t at_local = serve(unit, crossLink(coord_unit, unit, sent));
+            uint64_t arrive = crossLink(coord_unit, unit, sent);
+            uint64_t at_local = serve(unit, arrive);
             s_global_msgs.inc();
             release = at_local + p.local_msg_cycles;
+            traceMsg("barrier_depart_local Master SE%u -> SE%u -> core %u: sent %lu, link arrive %lu, served %lu, "
+                  "release %lu", coord_unit, unit, core, sent, arrive, at_local, release);
         } else {
             release = sent + p.local_msg_cycles;
+            traceMsg("barrier_depart_local SE%u -> core %u: sent %lu, release %lu", coord_unit, core, sent, release);
         }
+        if (release < b.last_arrival) s_early_releases.inc();
         release_of_core[core] = release;
         last_release = MAX(last_release, release);
     }
+    if (b.overflowed) {
+        // The variable's lists are empty again: it leaves memory mode (Sec 4.4's release-type decrement). In a
+        // one-level barrier only the coordinating SE ever held the variable, so there is no other counter to
+        // decrease and no decrease_indexing_counter message to send.
+        uint32_t idx = counterIdx(addr);
+        if (e.counters[idx]) e.counters[idx]--;
+    } else {
+        stFree(coord_unit, addr);
+    }
+    finishBarrier(coord_unit, b, last_release);
+    e.barriers.erase(addr);
+}
+
+/* Two-level release. The Master SE sends barrier_depart_global to every other SE in its global waiting list, each of
+ * which takes it and sends barrier_depart_local to its own cores; then the Master sends barrier_depart_local to its own
+ * cores. (Global list first: the paper leaves the order open.) */
+void SyncronSystem::releaseTwoLevel(uint32_t coord, uint64_t addr) {
+    Engine& ce = engines[coord];
+    BarrierState& b = ce.barriers[addr];
+    uint64_t last_release = 0;
+    auto fan_out = [&](uint32_t u, uint64_t from) {
+        Engine& le = engines[u];
+        LocalBarrier& lb = le.local_barriers[addr];
+        for (size_t i = 0; i < lb.waiters.size(); i++) {
+            uint32_t core = lb.waiters[i];
+            uint64_t sent = serve(u, MAX(from, le.spu_free));
+            s_local_msgs.inc();
+            uint64_t release = sent + p.local_msg_cycles;
+            traceMsg("barrier_depart_local SE%u -> core %u: sent %lu, release %lu", u, core, sent, release);
+            if (release < b.last_arrival) s_early_releases.inc();
+            release_of_core[core] = release;
+            last_release = MAX(last_release, release);
+        }
+        stFree(u, addr);
+        le.local_barriers.erase(addr);
+    };
+    for (uint32_t u = 0; u < p.units; u++) {
+        if (u == coord || !b.global_list[u]) continue;
+        uint64_t sent = serve(coord, MAX(b.last_arrival, ce.spu_free));
+        uint64_t arrive = crossLink(coord, u, sent);
+        uint64_t taken = serve(u, arrive);
+        s_global_msgs.inc();
+        traceMsg("barrier_depart_global Master SE%u -> SE%u: sent %lu, link arrive %lu, served %lu", coord, u, sent, arrive,
+              taken);
+        fan_out(u, taken);
+    }
+    fan_out(coord, b.last_arrival);
+    finishBarrier(coord, b, last_release);
+    ce.barriers.erase(addr);
+}
+
+void SyncronSystem::finishBarrier(uint32_t coord_unit, const BarrierState& b, uint64_t last_release) {
+    traceMsg("done: last release %lu = %lu cycles after the last arrival", last_release, last_release - b.last_arrival);
     s_barriers.inc();
     s_barriers_per_unit.inc(coord_unit);
     s_barrier_participants.inc(b.participants);
     s_barrier_release_cycles.inc(last_release - b.last_arrival);  // cost once everybody has arrived
     s_barrier_span_cycles.inc(last_release - b.first_arrival);    // cost including arrival skew
     s_barrier_skew_cycles.inc(b.last_arrival - b.first_arrival);
-    if (b.overflowed) {
-        // The variable's lists are empty again: it leaves memory mode (Sec 4.4's release-type decrement). For a
-        // barrier only the coordinating SE ever held the variable -- Sec 4.3 keeps local SEs out of it -- so there is
-        // no other counter to decrease and no decrease_indexing_counter message to send.
-        uint32_t idx = counterIdx(addr);
-        if (e.counters[idx]) e.counters[idx]--;
-    } else {
-        stFree(coord_unit, addr);
-    }
-    e.barriers.erase(addr);
 }
 
 void SyncronSystem::msgSend(uint32_t src_core, uint32_t dst_core, uint64_t tag, uint64_t now) {
@@ -420,6 +577,18 @@ void SyncronSystem::initStats(AggregateStat* parent) {
     s_link_msgs.init("linkMsgs", "messages that crossed an inter-unit link (SE and software)"); st->append(&s_link_msgs);
     s_link_bytes.init("linkBytes", "bytes those messages put on the links"); st->append(&s_link_bytes);
     s_link_queue_cycles.init("linkQueueCycles", "cycles messages waited for a busy link"); st->append(&s_link_queue_cycles);
+    s_spu_inversions.init("spuInversions", "messages an SPU served after one that arrived later (bound-phase call "
+                                           "order, not simulated order)");
+    st->append(&s_spu_inversions);
+    s_spu_inversion_cycles.init("spuInversionCycles", "summed: how much earlier those messages had arrived");
+    st->append(&s_spu_inversion_cycles);
+    s_early_releases.init("earlyReleases", "cores released before the barrier's last arrival, in modelled time "
+                                           "(must be 0)");
+    st->append(&s_early_releases);
+    s_two_level_barriers.init("twoLevelBarriers", "barriers every core took part in, run with Sec 4.1.3's two-level "
+                                                   "protocol");
+    st->append(&s_two_level_barriers);
+    s_link_hops.init("linkHops", "link traversals by messages (one per hop on a mesh)"); st->append(&s_link_hops);
     s_link_max_queue.init("linkMaxQueue", "longest single wait for a link (a large value flags bound-phase ordering, "
                                           "since legitimate queueing is a few occupancy slots)");
     st->append(&s_link_max_queue);

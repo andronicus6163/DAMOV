@@ -17,15 +17,24 @@
  *     `global_msg_cycles` after it got on. Sec 4.2's message is a 64-bit address, a 6-bit opcode, a 6-bit core id
  *     and a 64-bit MessageInfo = 140 bits = 18 bytes. The software baselines' messages use the same links, as the
  *     paper says they do.
+ *     Past Table 5's 4 units the paper gives no topology; with `mesh_x` > 0 the units form a 2D mesh `mesh_x` units
+ *     wide (row-major), routed X then Y, each hop one such link (latency + occupancy) -- the same rule the memory
+ *     model's links use (HBMStack `inter_unit_topology = mesh`). With `mesh_x` = 0 every pair has its own link.
  *     NOT shared with data: the memory model has its own copy of the same links (HBMStack `inter_unit = link`), in
  *     memory ticks and in the weave phase, and the two cannot be one occupancy state across zsim's phases. So
  *     messages queue behind messages and data behind data, but not one behind the other.
  *   - a variable's Master SE is the unit whose memory holds it: (address / bytes_per_unit) % units, the same rule the
  *     memory model uses for unit-major addressing.
  *   - barrier_wait_within_unit: the local SE counts its own cores and releases them (no global traffic).
- *     barrier_wait_across_units: the local SE forwards every arrival to the Master SE, which counts ALL participants
- *     and sends the departures back down. Sec 4.3 says this is deliberately one-level ("local SEs re-direct all
- *     messages received from their local NDP cores to the Master SE"), so this model does not aggregate per unit.
+ *     barrier_wait_across_units has two protocols, chosen by Sec 4.1.3:
+ *       one-level, "if a smaller number of cores than the total available cores of the NDP system participate in the
+ *         barrier ... local SEs re-direct all messages (received from their local NDP cores) to the Master SE, which
+ *         globally coordinates the barrier among all participating cores" -- no aggregation per unit;
+ *       two-level, when every core participates: each SE counts its own cores and sends one barrier_wait_global to
+ *         the Master SE; the Master sends barrier_depart_global to each SE, which sends barrier_depart_local to its
+ *         cores (Table 3's opcodes). The paper does not say which of its lists the Master serves first; here the
+ *         global list goes first (the other order would delay every remote unit by one local fan-out).
+ *     Cost rule, both protocols: a message costs one SPU service at every SE it passes through.
  *
  * OVERFLOW (Sec 4.4, phase S5)
  *   "When an SE receives a message with acquire-type semantics for a synchronization variable and there is no
@@ -110,7 +119,8 @@ struct Params {
     uint32_t local_msg_cycles = 2;     // core <-> local SE, one way, in core cycles
     uint32_t global_msg_cycles = 80;   // inter-unit link traversal, one way (Table 5: 40 ns = 80 cycles at 2 GHz)
     double link_bw_gbps = 12.8;        // Table 5: per direction
-    uint32_t msg_bytes = 18;           // Sec 4.2: 64 + 6 + 6 + 64 bits = 140 bits
+    uint32_t msg_bytes = 18;           // Sec 4.2: 64 + 6 + 6 + 64 bits = 140 bits (the 6-bit core id grows past 64 cores)
+    uint32_t mesh_x = 0;               // 0 = one link per pair of units; > 0 = 2D mesh this many units wide
     uint64_t bytes_per_unit = 1ull << 30;
     // Sec 4.4 overflow: one syncronVar access costs this much SPU time. Measured on this machine model, not invented:
     // the S2 pointer-chase run reports pim_latency/pim_requests = 29.4 memory ticks = 58.8 ns = 118 core cycles at
@@ -120,6 +130,10 @@ struct Params {
     uint32_t overflow_mem_cycles = 118;
     uint32_t overflow_arrive_accesses = 2;
     uint32_t overflow_release_accesses = 2;
+    // Message trace for checking a barrier by hand against the protocol: every message of barriers
+    // [trace_from, trace_from + trace_count) is logged with its cycles. Off by default.
+    uint32_t trace_from = 0;
+    uint32_t trace_count = 0;
 };
 
 class SyncronSystem : public GlobAlloc {
@@ -155,13 +169,22 @@ class SyncronSystem : public GlobAlloc {
     struct BarrierState {
         uint32_t participants = 0;  // TableInfo
         uint32_t arrived = 0;
-        uint64_t local_list = 0;   // bit per core of the coordinating unit that is waiting
-        uint64_t global_list = 0;  // bit per SE that has cores waiting
+        uint64_t local_list = 0;       // bit per core of the coordinating unit that is waiting
+        g_vector<uint8_t> global_list;  // one entry per SE that has cores waiting (one bit each in hardware)
         g_vector<uint32_t> waiter_core;
         g_vector<uint64_t> waiter_served;  // when the coordinating SPU finished that arrival
         uint64_t first_arrival = 0;
         uint64_t last_arrival = 0;
         bool overflowed = false;  // serviced through main memory (Sec 4.4)
+        bool two_level = false;   // every core participates (Sec 4.1.3)
+    };
+
+    /* Two-level barriers only: one SE's count and waiting list for its own cores. */
+    struct LocalBarrier {
+        uint32_t count = 0;
+        uint64_t first = 0;
+        uint64_t last = 0;
+        g_vector<uint32_t> waiters;
     };
 
     struct STEntry {
@@ -177,8 +200,10 @@ class SyncronSystem : public GlobAlloc {
 
     struct Engine {
         uint64_t spu_free = 0;
+        uint64_t last_served_arrival = 0;  // arrival cycle of the message this SPU served last
         g_vector<STEntry> st;
         g_unordered_map<uint64_t, BarrierState> barriers;  // keyed by variable address
+        g_unordered_map<uint64_t, LocalBarrier> local_barriers;  // two-level barriers, this SE's own cores
         g_vector<uint32_t> counters;                       // indexing counters (Sec 4.4)
         uint32_t st_used = 0;
     };
@@ -192,8 +217,13 @@ class SyncronSystem : public GlobAlloc {
     bool stAlloc(uint32_t unit, uint64_t addr);  // false = no entry: the variable goes to memory mode (Sec 4.4)
     void stFree(uint32_t unit, uint64_t addr);
     uint64_t barrierArrive(uint32_t core_id, uint64_t addr, bool across_units, uint64_t now);
+    uint64_t barrierArriveTwoLevel(uint32_t core_id, uint32_t unit, uint32_t coord, uint64_t addr,
+                                   uint32_t participants, uint64_t now);
     uint64_t barrierArriveIdeal(uint32_t core_id, uint64_t addr, uint64_t now);
     void releaseBarrier(uint32_t coord_unit, uint64_t addr, bool across_units);
+    void releaseTwoLevel(uint32_t coord, uint64_t addr);
+    void finishBarrier(uint32_t coord_unit, const BarrierState& b, uint64_t last_release);
+    void traceMsg(const char* fmt, ...) __attribute__((format(printf, 2, 3)));
 
     Params p;
     uint32_t service_core_cycles;
@@ -212,7 +242,7 @@ class SyncronSystem : public GlobAlloc {
         s_barrier_skew_cycles, s_st_peak, s_arrivals, s_overflow_msgs, s_overflow_barriers, s_overflow_aliased,
         s_overflow_mem_accesses, s_overflow_mem_cycles, s_st_full_events, s_counter_peak, s_sw_msgs,
         s_sw_global_msgs, s_sw_recv, s_sw_recv_empty, s_sw_msg_wait_cycles, s_link_msgs, s_link_bytes,
-        s_link_queue_cycles, s_link_max_queue;
+        s_link_queue_cycles, s_link_max_queue, s_two_level_barriers, s_early_releases, s_spu_inversions, s_spu_inversion_cycles, s_link_hops;
     VectorCounter s_msgs_per_unit, s_msgs_per_opcode, s_barriers_per_unit;
 };
 

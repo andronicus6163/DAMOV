@@ -48,6 +48,9 @@ mem = ramulator.memory_system.HBMStack(
     inter_unit=os.environ.get("HBM_INTER_UNIT", "link"),
     inter_unit_latency_ps=int(os.environ.get("INTER_UNIT_LATENCY_PS", "40000")),   # Table 5: 40 ns per cache line
     inter_unit_bw_gbps=float(os.environ.get("INTER_UNIT_BW_GBPS", "12.8")),        # Table 5: per direction
+    # Past Table 5's 4 units: how the units are wired ("full" = a link per pair; "mesh" = 2D mesh HBM_MESH_X wide).
+    inter_unit_topology=os.environ.get("HBM_INTER_UNIT_TOPOLOGY", "full"),
+    inter_unit_mesh_x=int(os.environ.get("HBM_MESH_X", "0")),
 )
 
 sim = ramulator.Simulation(frontend, mem)

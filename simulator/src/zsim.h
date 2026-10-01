@@ -77,6 +77,7 @@ enum ProcExitStatus {
 };
 
 namespace syncron { class SyncronSystem; }
+class ClusterNet;
 
 struct GlobSimInfo {
     //System configuration values, all read-only, set at initialization
@@ -86,6 +87,9 @@ struct GlobSimInfo {
 
     // SynCron (HPCA'21): one Synchronization Engine per NDP unit, driven by the req_sync/req_async magic ops.
     syncron::SyncronSystem* syncron;
+
+    // Network between the processors of a multi-processor (MPI) run, driven by the net_send/net_recv magic ops.
+    ClusterNet* cluster;
 
     // Uncached window (virtual byte addresses, registered by the app with ZSIM_MAGIC_OP_UNCACHED_REGION).
     // Accesses inside it are never served by a cache: they go to memory every time, and no directory

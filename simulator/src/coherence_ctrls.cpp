@@ -260,6 +260,7 @@ uint64_t MESITopCC::sendInvalidates(Address lineAddr, uint32_t lineId, InvType t
 
 
 uint64_t MESITopCC::processEviction(Address wbLineAddr, uint32_t lineId, bool* reqWriteback, uint64_t cycle, uint32_t srcId) {
+    array[lineId].busyUntil = 0;  // the entry is about to hold another line
     if (nonInclusiveHack) {
         // Don't invalidate anything, just clear our entry
         array[lineId].clear();
@@ -274,6 +275,7 @@ uint64_t MESITopCC::processAccess(Address lineAddr, uint32_t lineId, AccessType 
                                   MESIState* childState, bool* inducedWriteback, uint64_t cycle, uint32_t srcId, uint32_t flags) {
     Entry* e = &array[lineId];
     uint64_t respCycle = cycle;
+    bool transfer = (type == GETX);  // GETS sets it below if it downgrades another child's exclusive copy
     switch (type) {
         case PUTX:
             assert(e->isExclusive());
@@ -304,6 +306,7 @@ uint64_t MESITopCC::processAccess(Address lineAddr, uint32_t lineId, AccessType 
                 if (e->isExclusive()) {
                     //Downgrade the exclusive sharer
                     respCycle = sendInvalidates(lineAddr, lineId, INVX, inducedWriteback, cycle, srcId);
+                    transfer = true;
                 }
 
                 assert_msg(!e->isExclusive(), "Can't have exclusivity here. isExcl=%d excl=%d numSharers=%d", e->isExclusive(), e->exclusive, e->numSharers);
@@ -338,6 +341,21 @@ uint64_t MESITopCC::processAccess(Address lineAddr, uint32_t lineId, AccessType 
             break;
 
         default: panic("!?");
+    }
+
+    if (serialize && (type == GETS || type == GETX)) {
+        if (e->busyUntil && e->busyChild != childId) {
+            uint64_t serial = e->busyUntil + dirLat + (respCycle - cycle);
+            if (serial > respCycle) {
+                profSerialized.inc();
+                profSerialCycles.inc(serial - respCycle);
+                respCycle = serial;
+            }
+        }
+        if (transfer) {
+            e->busyUntil = respCycle;
+            e->busyChild = childId;
+        }
     }
 
     return respCycle;

@@ -189,11 +189,15 @@ class MESITopCC : public GlobAlloc {
             uint32_t numSharers;
             std::bitset<MAX_CACHE_CHILDREN> sharers;
             bool exclusive;
+            uint64_t busyUntil;  // serializeTransfers: when the last ownership transfer of this line completed
+            uint32_t busyChild;  // ... and to which child
 
             void clear() {
                 exclusive = false;
                 numSharers = 0;
                 sharers.reset();
+                busyUntil = 0;
+                busyChild = 0;
             }
 
             bool isEmpty() {
@@ -214,11 +218,32 @@ class MESITopCC : public GlobAlloc {
         bool nonInclusiveHack;
         bool bypass;
 
+        // serializeTransfers (off by default): a blocking directory. An access that takes a line from another child --
+        // GETX, or a GETS that downgrades another child's exclusive copy -- cannot start until the previous such transfer
+        // of that line to a different child has completed (the requester has the data and the directory is unblocked),
+        // and then costs its own full latency: dirLat for the trip through this cache plus the invalidation round trip.
+        // Without it, N cores contending for one line each pay one transfer, all at once, instead of N in a row.
+        // A plain shared read waits out a transfer in flight but does not block other readers. Accesses reach the
+        // directory in bound-phase (host) order, so within one phase an earlier-cycle request can queue behind a later
+        // one; the number of serialized transfers is exact, their order within a phase is not.
+        bool serialize = false;
+        uint32_t dirLat = 0;
+        Counter profSerialized, profSerialCycles;
+
         PAD();
         lock_t ccLock;
         PAD();
 
     public:
+        void setSerializeTransfers(bool on, uint32_t lat) { serialize = on; dirLat = lat; }
+        void initStats(AggregateStat* cacheStat) {
+            if (!serialize) return;
+            profSerialized.init("serTransfers", "accesses delayed behind another child's transfer of the same line");
+            profSerialCycles.init("serCycles", "cycles those accesses were delayed");
+            cacheStat->append(&profSerialized);
+            cacheStat->append(&profSerialCycles);
+        }
+
         MESITopCC(uint32_t _numLines, bool _nonInclusiveHack, bool _bypass) : numLines(_numLines), nonInclusiveHack(_nonInclusiveHack), bypass(_bypass) {
             array = gm_calloc<Entry>(numLines);
             for (uint32_t i = 0; i < numLines; i++) {
@@ -286,6 +311,10 @@ static inline bool CheckForMESIRace(AccessType& type, MESIState* state, MESIStat
 // Non-terminal CC; accepts GETS/X and PUTS/X accesses
 class MESICC : public CC {
     private:
+        bool serializeTransfers = false;
+        uint32_t serializeDirLat = 0;
+
+    private:
         MESITopCC* tcc;
         MESIBottomCC* bcc;
         uint32_t numLines;
@@ -306,12 +335,16 @@ class MESICC : public CC {
         void setChildren(const g_vector<BaseCache*>& children, Network* network) {
             tcc = new MESITopCC(numLines, nonInclusiveHack, bypass);
             tcc->init(children, network, name.c_str());
+            tcc->setSerializeTransfers(serializeTransfers, serializeDirLat);
         }
 
         void initStats(AggregateStat* cacheStat) {
-            //no tcc stats
             bcc->initStats(cacheStat);
+            tcc->initStats(cacheStat);  // only the serializeTransfers counters, when enabled
         }
+
+        // Applied when setChildren builds the tcc (which does not exist yet at construction).
+        void setSerializeTransfers(bool on, uint32_t lat) { serializeTransfers = on; serializeDirLat = lat; }
 
         //Access methods
         bool startAccess(MemReq& req) {

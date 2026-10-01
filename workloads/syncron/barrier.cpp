@@ -110,6 +110,14 @@ struct Task {
     Sample* samples = nullptr;
 };
 
+// --check: a functional test of barrier semantics, run separately from the timing runs (its atomics add coherence
+// traffic). Every client bumps its group's counter before arriving; once released it must see every participant's
+// arrival for that round. zsim executes the program natively, so a core let through early would read a short count.
+bool g_check = false;
+volatile uint64_t* g_arrivals = nullptr;  // one per group
+const uint32_t* g_group_size = nullptr;
+volatile uint64_t g_violations = 0;
+
 volatile uint64_t g_registered = 0;
 volatile uint64_t g_clients_done = 0;
 uint64_t g_total_clients = 0;
@@ -128,6 +136,7 @@ void client_work(Task* t) {
     const Layout& L = *t->L;
     for (uint32_t s = 0; s < t->rounds; s++) {
         t->samples[s].arrive = zsim_now();
+        if (g_check) __sync_fetch_and_add(&g_arrivals[t->group], 1);
         switch (L.scheme) {
             case SCH_SYNCRON:
             case SCH_IDEAL:
@@ -139,6 +148,8 @@ void client_work(Task* t) {
                 break;
         }
         t->samples[s].release = zsim_now();
+        if (g_check && g_arrivals[t->group] < (uint64_t)g_group_size[t->group] * (s + 1))
+            __sync_fetch_and_add(&g_violations, 1);
     }
     if (L.scheme == SCH_CENTRAL || L.scheme == SCH_HIER) sw_client_quit(t->server_core);
     __sync_fetch_and_add(&g_clients_done, 1);
@@ -196,6 +207,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(k, "--clients-per-unit")) L.clients_per_unit = atoi(val());
         else if (!strcmp(k, "--groups")) L.groups = atoi(val());
         else if (!strcmp(k, "--stack-mb")) stack_mb = atoi(val());
+        else if (!strcmp(k, "--check")) g_check = true;
         else {
             fprintf(stderr, "usage: barrier --scheme syncron|ideal|central|hier [--scope unit|units] "
                             "[--clients-per-unit 15] [--units-used 4] [--groups 1] [--rounds 20] [--warmup 2] "
@@ -241,6 +253,10 @@ int main(int argc, char** argv) {
     printf("barrier: scheme=%s scope=%s %u units x %u cores, %u clients/unit on %u units = %u clients, "
            "%u barrier groups, %u rounds (+%u warmup)\n", scheme_names[L.scheme], L.across ? "units" : "unit",
            L.units, L.cores_per_unit, L.clients_per_unit, L.units_used, L.clients(), ngroups, rounds, warmup);
+
+    std::vector<uint64_t> check_counts(ngroups, 0);
+    g_arrivals = check_counts.data();
+    g_group_size = participants.data();
 
     zsim_roi_begin();
 
@@ -372,7 +388,12 @@ int main(int argc, char** argv) {
     printf("BARRIER wait_last_cycles=%.1f wait_first_cycles=%.1f wait_med_cycles=%.1f\n",
            *std::min_element(waits.begin(), waits.end()), *std::max_element(waits.begin(), waits.end()),
            median(waits));
-    printf("VERIFY %s\n", layout_ok ? "PASS" : "FAIL core layout is not thread i on core i");
+    if (g_check) {
+        printf("CHECK arrivals-before-release violations=%lu over %u rounds x %u clients\n", (uint64_t)g_violations,
+               total_rounds, L.clients());
+        if (g_violations) layout_ok = false;
+    }
+    printf("VERIFY %s\n", layout_ok ? "PASS" : "FAIL core layout, or a client released before every arrival");
     printf("BARRIER done\n");
     return layout_ok ? 0 : 2;
 }

@@ -25,7 +25,6 @@ obj/
 __pycache__/
 m5out/
 megatools-1.11.1.20230212-linux-x86_64/
-workloads/
 simulator/zsim_stats/
 simulator/smoke_test/stream_roi
 
@@ -37,6 +36,22 @@ autom4te.cache/
 pin.log
 *.orig
 .toolchains/scons2
+
+# --- workloads: upstream clones (own .git) and DAMOV's original image layer (3.6 GB) stay out ---
+workloads/damov-original/
+workloads/hpcg/
+workloads/ligra/
+workloads/STREAM/
+workloads/sync-primitives/*
+!workloads/sync-primitives/*.cpp
+!workloads/sync-primitives/*.h
+!workloads/sync-primitives/*.sh
+
+# --- SynCron harness: sources tracked; anything else there (the bionic binaries build.sh writes) is not ---
+workloads/syncron/*
+!workloads/syncron/*.cpp
+!workloads/syncron/*.h
+!workloads/syncron/*.sh
 
 # --- workload run byproducts written to the zsim working directory (do not commit) ---
 simulator/hpcg*.txt

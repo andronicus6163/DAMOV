@@ -6,7 +6,9 @@
 Reads the same logs and stats run.py writes. Every SynCron point is also checked against the protocol: its modelled
 cost (the engine's barrierReleaseCycles / barriers) must lie between the local-only and the remote-last bounds of
 Sec 4.3's arithmetic -- N departures serialised at 24 core cycles each, plus one link traversal and the remote SE's
-service when the last departure goes to another unit.
+service when the last departure goes to another unit. When every core participates, Sec 4.1.3's two-level protocol
+applies instead, and its cost is exact: (units-1) global departures + link + the remote SE's service + that unit's
+local fan-out + the last hop to the core.
 """
 import pathlib
 import re
@@ -44,7 +46,8 @@ def load(name):
         block = re.search(r"^ syncron:.*?(?=^ \S)", d, re.M | re.S)
         if block:
             for key in ("barriers", "barrierReleaseCycles", "localMsgs", "globalMsgs", "swMsgs", "swGlobalMsgs",
-                        "linkMsgs", "linkQueueCycles", "linkMaxQueue"):
+                        "linkMsgs", "linkQueueCycles", "linkMaxQueue", "twoLevelBarriers", "spuInversions",
+                        "spuInversionCycles", "arrivals"):
                 m = re.search(rf"^\s+{key}: (\d+)", block.group(0), re.M)
                 if m:
                     r[key] = int(m.group(1))
@@ -71,6 +74,9 @@ def spread(r):
 def syncron_bounds(n, used, link):
     """Sec 4.3 arithmetic for the modelled cost (last release - last arrival)."""
     link_cycles = link * MHZ // 1000
+    if used == 4 and n == 64:  # every core: two-level (Sec 4.1.3), global departures first
+        exact = (used - 1) * SPU + link_cycles + SPU + (n // used) * SPU + LOCAL
+        return exact, exact
     lo = n * SPU + LOCAL                       # the last departure goes to a core in the Master's own unit
     hi = n * SPU + (link_cycles + SPU + LOCAL if used > 1 else LOCAL)  # ... or to another unit
     return lo, hi
@@ -78,8 +84,8 @@ def syncron_bounds(n, used, link):
 
 def participants_table(scope, used, cpus, title):
     print(f"\n### {title}\n")
-    print("| N | per unit | Ideal | SynCron | Hier | Central | SynCron modelled | protocol bound | check |")
-    print("|---:|---:|---:|---:|---:|---:|---:|---:|:---:|")
+    print("| N | per unit | Ideal | SynCron | Hier | Central | SynCron modelled | protocol bound | check | SPU out-of-order |")
+    print("|---:|---:|---:|---:|---:|---:|---:|---:|:---:|---:|")
     for cpu in cpus:
         rs = {s: load(run_name(scope, s, cpu, used, 40)) for s in SCHEMES}
         n = cpu * used
@@ -90,8 +96,12 @@ def participants_table(scope, used, cpus, title):
             mod = f"{sy['modelled']:,.1f}"
             bound = f"{lo}" if lo == hi else f"{lo}–{hi}"
             ok = "✓" if lo - 0.5 <= sy["modelled"] <= hi + 0.5 else "✗"
+        inv = "—"
+        if sy and not sy.get("broken") and "spuInversions" in sy and sy.get("arrivals"):
+            inv = (f"{100.0 * sy['spuInversions'] / (sy['localMsgs'] + sy['globalMsgs']):.1f}% "
+                   f"({sy['spuInversionCycles'] / max(sy['spuInversions'], 1):.0f} cyc)")
         print(f"| {n} | {cpu} | {cell(rs['ideal'])} | {cell(sy)} {spread(sy)} | {cell(rs['hier'])} {spread(rs['hier'])} "
-              f"| {cell(rs['central'])} {spread(rs['central'])} | {mod} | {bound} | {ok} |")
+              f"| {cell(rs['central'])} {spread(rs['central'])} | {mod} | {bound} | {ok} | {inv} |")
 
 
 def placement_table():
@@ -136,6 +146,7 @@ def main():
     participants_table("unit", 1, (1, 2, 4, 8, 15, 16), "Participants inside one NDP unit (barrier_wait_within_unit)")
     participants_table("units", 4, (1, 2, 4, 8, 15, 16), "Participants spread over 4 NDP units (barrier_wait_across_units)")
     placement_table()
+    link_table(16)
     link_table(15)
     link_table(4)
     return 0

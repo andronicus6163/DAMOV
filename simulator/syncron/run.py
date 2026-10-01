@@ -127,7 +127,7 @@ WORKLOADS = {
     "barrier": ("../workloads/syncron/barrier --scheme {scheme} --scope {mode} "
                 "--clients-per-unit {clients_per_unit} --units-used {units_used} --groups {groups} "
                 "--rounds {iters} --warmup {warmup} --units {units} --cores-per-unit {cores_per_unit} "
-                "--stack-mb {stack_mb}"),
+                "--stack-mb {stack_mb}{check}"),
 }
 
 # The Synchronization Engine (Table 5). Only added to the config when --syncron is given.
@@ -143,11 +143,14 @@ SYNCRON_BLOCK = """
         localMsgCycles = {local_msg};    // core <-> local SE, one way
         globalMsgCycles = {global_msg};  // inter-unit link traversal, one way (Table 5: 40 ns)
         linkBwGbps = {link_bw};          // Table 5: 12.8 GB/s per direction -- messages occupy the link
-        msgBytes = 18;                   // Sec 4.2: 64-bit addr + 6-bit opcode + 6-bit core id + 64-bit info
+        msgBytes = {msg_bytes};                   // Sec 4.2: 64-bit addr + 6-bit opcode + core id + 64-bit info
+        meshX = {mesh_x};                     // 0 = a link per pair of units (Table 5's 4 units); > 0 = 2D mesh this wide
         bytesPerUnit = {bytes_per_unit}L;
         // Sec 4.4 overflow: one syncronVar access, in core cycles. Measured on this machine model (the S2 chase run
         // reports pim_latency/pim_requests = 29.4 memory ticks = 58.8 ns = 118 core cycles at 2 GHz).
         overflowMemCycles = {overflow_mem};
+        traceFrom = {trace_from};         // log every message of barriers [traceFrom, traceFrom + traceCount)
+        traceCount = {trace_count};
     }};
 """
 
@@ -164,7 +167,10 @@ NAME_PATTERNS = [
     (re.compile(r"^f(\d+)$"), lambda m, r: r.update(mhz=int(m.group(1)))),
     (re.compile(r"^(timing|ooo)$"), lambda m, r: r.update(core=m.group(1))),
     (re.compile(r"^(syncron|ideal|central|hier)$"), lambda m, r: r.update(scheme=m.group(1))),
-    (re.compile(r"^(nonet|noarena)$"), lambda m, r: r.update(**{m.group(1): 1})),
+    (re.compile(r"^mesh(\d+)$"), lambda m, r: r.update(mesh_x=int(m.group(1)))),
+    (re.compile(r"^(xbu)$"), lambda m, r: r.update(crossbar="per-unit")),
+    (re.compile(r"^(nonet|noarena|trace|check)$"), lambda m, r: r.update(**{m.group(1): 1})),
+    (re.compile(r"^m([A-Za-z0-9.-]+)$"), lambda m, r: r.update(mem=m.group(1))),
 ]
 
 SYNCRON_STATS = ("reqSync", "reqAsync", "barrierPolls", "localMsgs", "globalMsgs", "queueCycles", "serviceCycles",
@@ -172,7 +178,8 @@ SYNCRON_STATS = ("reqSync", "reqAsync", "barrierPolls", "localMsgs", "globalMsgs
                  "stPeakEntries", "arrivals", "overflowMsgs", "overflowBarriers", "overflowAliased",
                  "overflowMemAccesses", "overflowMemCycles", "stFullEvents", "indexingCounterPeak", "swMsgs",
                  "swGlobalMsgs", "swMsgsReceived", "swRecvEmpty", "swMsgWaitCycles", "linkMsgs", "linkBytes",
-                 "linkQueueCycles", "linkMaxQueue")
+                 "linkQueueCycles", "linkMaxQueue", "twoLevelBarriers", "earlyReleases",
+                 "spuInversions", "spuInversionCycles")
 
 
 def name_of(a):
@@ -182,11 +189,24 @@ def name_of(a):
                   f"g{a.groups}", f"st{a.st_entries}", f"l{a.link_ns}", f"w{a.warmup}"]
     else:
         parts += [f"u{a.units}x{a.cores_per_unit}", f"t{a.threads}"]
+    # The memory family is part of the name only when it is not HBM1, so every earlier run keeps its name; the unit
+    # count (u..), the topology (mesh..) and the crossbar (xbu) are named separately.
+    family = pathlib.Path(a.mem).stem.split("-")[0]
+    if family != "HBM1":
+        parts.append("m" + family)
+    if a.mesh_x:
+        parts.append(f"mesh{a.mesh_x}")
+    if a.crossbar == "per-unit":
+        parts.append("xbu")
     parts += [f"p{a.phase}", f"f{int(a.mhz)}", a.core.lower()]
     if a.no_network:
         parts.append("nonet")
     if a.no_arena:
         parts.append("noarena")
+    if a.trace_count:
+        parts.append("trace")
+    if a.check:
+        parts.append("check")
     return "__".join(parts)
 
 
@@ -220,15 +240,27 @@ def write_cfg(a):
     cmd = WORKLOADS[a.workload].format(threads=a.threads, mode=a.mode, kb=a.kb, iters=a.iters, units=a.units,
                                        cores_per_unit=a.cores_per_unit, stack_mb=a.stack_mb, scheme=a.scheme,
                                        clients_per_unit=a.clients_per_unit, units_used=a.units_used,
-                                       groups=a.groups, warmup=a.warmup, arena=" --no-arena" if a.no_arena else "")
+                                       groups=a.groups, warmup=a.warmup, check=" --check" if a.check else "",
+                                       arena=" --no-arena" if a.no_arena else "")
+    netfile = a.netfile or (f"network_{a.units}x{a.cores_per_unit}_unit.mesh" if a.crossbar == "per-unit"
+                            else "network_4x16.mesh")
+    if not (HERE / netfile).exists():
+        sys.exit(f"{netfile}: missing -- gen_network.py --units {a.units} --cores-per-unit {a.cores_per_unit} "
+                 f"--crossbar {a.crossbar} > {netfile}")
     network_block = ("" if a.no_network else
-                     f'    networkType = "mesh";\n    networkFile = "syncron/{a.netfile}";\n')
+                     f'    networkType = "mesh";\n    networkFile = "syncron/{netfile}";\n')
+    # Sec 4.2's message has a 6-bit core id, enough for Table 5's 64 cores; past that the id needs more bits.
+    cores = a.units * a.cores_per_unit
+    id_bits = max(6, (cores - 1).bit_length())
+    msg_bytes = (64 + 6 + id_bits + 64 + 7) // 8
     # The inter-unit traversal (Table 5: 40 ns) in core cycles; the crossbar's 1-cycle-arb + 1-cycle-hop is local_msg.
     global_msg = int(round(a.link_ns * 1e-9 * a.mhz * 1e6))
     syncron_block = ("" if not a.syncron else
                      SYNCRON_BLOCK.format(scheme=a.scheme, units=a.units, cores_per_unit=a.cores_per_unit,
                                           local_msg=2, global_msg=global_msg, st_entries=a.st_entries,
-                                          link_bw=f"{a.link_bw_gbps:.2f}",
+                                          link_bw=f"{a.link_bw_gbps:.2f}", msg_bytes=msg_bytes, mesh_x=a.mesh_x,
+                                          trace_from=a.trace_from,
+                                          trace_count=a.trace_count,
                                           overflow_mem=a.overflow_mem_cycles,
                                           bytes_per_unit=a.stack_mb * 1024 * 1024))
     # The template caps runs at 1e9 instructions; keep the knob, because "equal-instruction windows" is the planned
@@ -364,7 +396,12 @@ def main():
     ap.add_argument("--stack-mb", type=int, default=1024, help="modelled memory per stack; must match the memory config")
     ap.add_argument("--no-arena", action="store_true", help="malloc instead of per-unit placement (the S1 baseline)")
     ap.add_argument("--mem", default="ramulator2-configs/HBM1-1Gb-4stack.yaml")
-    ap.add_argument("--netfile", default="network_4x16.mesh")
+    ap.add_argument("--netfile", default="", help="default: network_4x16.mesh, or network_<units>x<cpu>_unit.mesh "
+                                                    "with --crossbar per-unit")
+    ap.add_argument("--crossbar", choices=["line", "per-unit"], default="line",
+                    help="line = S1-S9's network file; per-unit = each L1 uses only its own unit's crossbar")
+    ap.add_argument("--mesh-x", type=int, default=0,
+                    help="units per mesh row (0 = a link per pair of units); must match the memory config's mesh")
     ap.add_argument("--no-network", action="store_true", help="drop the crossbar model (sanity check only)")
     ap.add_argument("--syncron", action="store_true", help="add the Synchronization Engine (sys.syncron)")
     ap.add_argument("--scheme", default="syncron", choices=["syncron", "ideal", "central", "hier"],
@@ -387,6 +424,10 @@ def main():
                     help="inter-unit link latency (Table 5: 40 ns); moves the message and the data side together")
     ap.add_argument("--link-list", default="", help="comma-separated link latencies to sweep (Fig 16: 40 -> 500 ns)")
     ap.add_argument("--link-bw-gbps", type=float, default=12.8, help="inter-unit link bandwidth per direction")
+    ap.add_argument("--check", action="store_true",
+                    help="functional barrier-semantics check (adds atomics: never use these runs for timing)")
+    ap.add_argument("--trace-from", type=int, default=0, help="first barrier (0-based) whose messages are logged")
+    ap.add_argument("--trace-count", type=int, default=0, help="how many barriers to log (0 = no trace)")
     ap.add_argument("--cpu-list", default="", help="comma-separated --clients-per-unit values to sweep")
     ap.add_argument("--overflow-mem-cycles", type=int, default=118,
                     help="core cycles for one syncronVar access by a Master SE in overflow mode")

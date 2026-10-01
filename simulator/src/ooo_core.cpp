@@ -353,7 +353,8 @@ inline void OOOCore::bbl(Address bblAddr, BblInfo* bblInfo) {
 
                     uint64_t reqSatisfiedCycle = dispatchCycle;
                     if (addr != ((Address)-1L)) {
-                        reqSatisfiedCycle = l1d->load(addr, dispatchCycle) + L1D_LAT;
+                        reqSatisfiedCycle = ((uop->pad & UOP_FLAG_RFO) ? l1d->store(addr, dispatchCycle)
+                                                                       : l1d->load(addr, dispatchCycle)) + L1D_LAT;
                         cRec.record(curCycle, dispatchCycle, reqSatisfiedCycle);
                         if(zinfo->numCores == 1){
                             locality_monitor.push_address(addr,size);
@@ -602,6 +603,12 @@ void OOOCore::advance(uint64_t targetCycle) {
      * counters in e.g., the ROB does not change much; consider full-blown
      * rebases though if weave models fail to validate for some app.
      */
+}
+
+// A stall decided outside the pipeline: the core does nothing until `cycle`, like a long-latency event with an empty
+// window. The instructions of the current basic block are simulated at the next bbl() and so land after the stall.
+void OOOCore::idleUntil(uint64_t cycle) {
+    if (cycle > curCycle) advance(cycle);
 }
 
 // Pin interface code

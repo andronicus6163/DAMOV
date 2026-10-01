@@ -20,6 +20,10 @@
 #define ZSIM_MAGIC_OP_REQ_ASYNC         (1043)
 #define ZSIM_MAGIC_OP_MSG_SEND          (1044)   /* SynCron baselines: hardware message passing between NDP cores */
 #define ZSIM_MAGIC_OP_MSG_RECV          (1045)
+#define ZSIM_MAGIC_OP_NET_SEND          (1046)   /* cluster network between processors (src/cluster_net.h) */
+#define ZSIM_MAGIC_OP_NET_RECV          (1047)
+#define ZSIM_MAGIC_OP_PARK              (1048)   /* idle this core to the end of the simulator phase */
+#define ZSIM_MAGIC_OP_NOW_ABS           (1049)   /* this core's cycle on the global timeline */
 
 #ifdef __x86_64__
 #define HOOKS_STR  "HOOKS"
@@ -79,6 +83,23 @@ static inline void zsim_uncached_region(void* addr, uint64_t bytes) {
 static inline uint64_t zsim_now() {
     return zsim_magic_op_ret(ZSIM_MAGIC_OP_NOW);
 }
+
+/* Cluster network (src/cluster_net.h). net_send does not block. net_recv returns the earliest message in this core's
+   inbox -- ZSIM_NET_VALID | source core << 48 | tag -- with the core stalled until it has arrived, or 0 when the
+   inbox is empty (the core has been parked to the end of the phase). */
+static inline void zsim_net_send(uint64_t dst_core, uint64_t tag) {
+    zsim_magic_op_args(ZSIM_MAGIC_OP_NET_SEND, dst_core, tag);
+}
+static inline uint64_t zsim_net_recv() { return zsim_magic_op_ret(ZSIM_MAGIC_OP_NET_RECV); }
+#define ZSIM_NET_VALID  (1ULL << 63)
+#define ZSIM_NET_SRC(w) (((w) >> 48) & 0x7FFFULL)
+#define ZSIM_NET_TAG(w) ((w) & ((1ULL << 48) - 1))
+
+/* Idle this core to the end of the simulator phase, keeping it: for waits outside a measurement. */
+static inline void zsim_park() { zsim_magic_op(ZSIM_MAGIC_OP_PARK); }
+
+/* This core's cycle on the global timeline: comparable across cores (zsim_now is not -- it counts unhalted cycles). */
+static inline uint64_t zsim_now_abs() { return zsim_magic_op_ret(ZSIM_MAGIC_OP_NOW_ABS); }
 
 static inline void zsim_work_begin() { zsim_magic_op(ZSIM_MAGIC_OP_WORK_BEGIN); }
 static inline void zsim_work_end() { zsim_magic_op(ZSIM_MAGIC_OP_WORK_END); }

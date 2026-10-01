@@ -33,7 +33,7 @@
 #define MAX_THREADS (2048)
 
 // How many children caches can each cache track? Note each bank is a separate child. This impacts sharer bit-vector sizes.
-#define MAX_CACHE_CHILDREN (2048)
+#define MAX_CACHE_CHILDREN (4096)  // was 2048: a 2048-core SynCron system has 4096 L1s under its (bypassed) LLC
 //#define MAX_CACHE_CHILDREN (1024)
 
 // Complex multiprocess runs need multiple clocks, and multiple port domains

@@ -47,6 +47,8 @@
  */
 enum UopType : uint8_t {UOP_GENERAL, UOP_LOAD, UOP_STORE, UOP_STORE_ADDR, UOP_FENCE};
 
+#define UOP_FLAG_RFO 1
+
 struct DynUop {
     uint16_t rs[MAX_UOP_SRC_REGS];
     uint16_t rd[MAX_UOP_DST_REGS];
@@ -55,7 +57,7 @@ struct DynUop {
     UopType type; //1 byte
     uint8_t portMask;
     uint8_t extraSlots; //FU exec slots
-    uint8_t pad; //pad to 4-byte multiple
+    uint8_t pad; //pad to 4-byte multiple; bit 0 (UOP_FLAG_RFO): a locked RMW's load, which takes the line exclusive
 
     void clear();
 };  // 16 bytes. TODO(dsm): check performance with wider operands

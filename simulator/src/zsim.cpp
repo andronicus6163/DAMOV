@@ -28,6 +28,7 @@
 
 #include "zsim.h"
 #include "syncron/sync_engine.h"
+#include "cluster_net.h"
 #include "ramulator2_mem_ctrl.h"
 #include <algorithm>
 //#include <bits/signum.h>
@@ -1205,6 +1206,10 @@ VOID SimEnd() {
 #define ZSIM_MAGIC_OP_REQ_ASYNC         (1043)
 #define ZSIM_MAGIC_OP_MSG_SEND          (1044)
 #define ZSIM_MAGIC_OP_MSG_RECV          (1045)
+#define ZSIM_MAGIC_OP_NET_SEND          (1046)
+#define ZSIM_MAGIC_OP_NET_RECV          (1047)
+#define ZSIM_MAGIC_OP_PARK              (1048)
+#define ZSIM_MAGIC_OP_NOW_ABS           (1049)
 
 VOID HandleMagicOp(THREADID tid, ADDRINT op, ADDRINT arg0, ADDRINT arg1, ADDRINT arg2, ADDRINT* ret) {
     //std::cout << "HandleMagicOp: " << op << std::endl;
@@ -1284,6 +1289,14 @@ VOID HandleMagicOp(THREADID tid, ADDRINT op, ADDRINT arg0, ADDRINT arg1, ADDRINT
             if (ret) *ret = (cid < zinfo->numCores) ? zinfo->cores[cid]->getCycles() : 0;
             return;
         }
+        case ZSIM_MAGIC_OP_NOW_ABS: {
+            // The calling core's cycle on the global timeline (curCycle), comparable across cores. NOW is unhalted
+            // cycles, which leave out the time a core sat idle before its thread arrived, so cores differ by a
+            // constant offset. Like NOW, it reads the core as of the previous basic block.
+            uint32_t cid = getCid(tid);
+            if (ret) *ret = (cid < zinfo->numCores) ? zinfo->cores[cid]->getCurCycle() : 0;
+            return;
+        }
         case ZSIM_MAGIC_OP_REQ_SYNC: {
             // SynCron Sec 4.1: req_sync addr, opcode, info -- issue a message to the local SE and block until the
             // ACK. The SE model returns the cycle the ACK arrives; the core is stalled until then, so the wait is
@@ -1335,6 +1348,36 @@ VOID HandleMagicOp(THREADID tid, ADDRINT op, ADDRINT arg0, ADDRINT arg1, ADDRINT
                 core->idleUntil(core->getPhaseEnd() + 1);
             }
             if (ret) *ret = word;
+            return;
+        }
+        case ZSIM_MAGIC_OP_NET_SEND: {
+            // Cluster network (cluster_net.h): arg0 = destination core, arg1 = a 48-bit tag. Does not block.
+            if (!zinfo->cluster) panic("Thread %d used net_send but sys.cluster is not configured", tid);
+            uint32_t cid = getCid(tid);
+            if (cid >= zinfo->numCores) return;
+            zinfo->cluster->send(cid, (uint32_t)arg0, arg1, zinfo->cores[cid]->getCurCycle());
+            return;
+        }
+        case ZSIM_MAGIC_OP_NET_RECV: {
+            // The earliest message in this core's inbox, the core stalled until it has arrived; an empty inbox parks
+            // the core to the end of the phase and returns 0.
+            if (!zinfo->cluster) panic("Thread %d used net_recv but sys.cluster is not configured", tid);
+            uint32_t cid = getCid(tid);
+            if (cid >= zinfo->numCores) return;
+            Core* core = zinfo->cores[cid];
+            uint64_t word = 0, resume = 0;
+            if (zinfo->cluster->recv(cid, core->getCurCycle(), &word, &resume)) core->idleUntil(resume);
+            else core->idleUntil(core->getPhaseEnd() + 1);
+            if (ret) *ret = word;
+            return;
+        }
+        case ZSIM_MAGIC_OP_PARK: {
+            // Idle this core to the end of the phase without giving it up: a wait that should cost neither simulated
+            // instructions (spinning) nor the core (blocking hands it to another thread).
+            uint32_t cid = getCid(tid);
+            if (cid >= zinfo->numCores) return;
+            Core* core = zinfo->cores[cid];
+            core->idleUntil(core->getPhaseEnd() + 1);
             return;
         }
         case ZSIM_MAGIC_OP_UNCACHED_REGION:
