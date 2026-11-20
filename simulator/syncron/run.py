@@ -128,6 +128,26 @@ WORKLOADS = {
                 "--clients-per-unit {clients_per_unit} --units-used {units_used} --groups {groups} "
                 "--rounds {iters} --warmup {warmup} --units {units} --cores-per-unit {cores_per_unit} "
                 "--stack-mb {stack_mb}{check}"),
+    # S10: the bounded-buffer monitor -- one SE lock and two SE condition variables. Clients alternate producer and
+    # consumer; throughput is the metric.
+    # S10: fetch-and-add. SynCron has no atomic RMW, so each add is a critical section under an SE lock.
+    "fetchadd": ("../workloads/syncron/fetchadd --clients {clients} --ops {iters} --counters {counters} "
+                 "--units {units} --cores-per-unit {cores_per_unit} --stack-mb {stack_mb}{check}"),
+    "monitor": ("../workloads/syncron/monitor{phases} --clients {clients} --ops {iters} --cap {cap} "
+                "--monitors {monitors} "
+                "--units {units} --cores-per-unit {cores_per_unit} --stack-mb {stack_mb}{check}"),
+    # S10: fetch-and-function. The SE has no opcode for an application operation, so Phi (an atomic max)
+    # runs on the NDP core inside the SE's lock. Same source as fetchadd, differing only in Phi.
+    "ff": ("../workloads/syncron/ff --clients {clients} --ops {iters} --cells {counters} "
+           "--units {units} --cores-per-unit {cores_per_unit} --stack-mb {stack_mb}{check}"),
+    # S10: put-with-signal. SynCron moves no payloads, so a handoff is a capacity-1 bounded buffer:
+    # one SE lock and two SE condition variables per producer/consumer pair.
+    "putsignal": ("../workloads/syncron/putsignal --clients {clients} --ops {iters} --words {words} "
+                  "--units {units} --cores-per-unit {cores_per_unit} --stack-mb {stack_mb}{check}"),
+    # S10: all-reduce. The SE's only collective is the barrier, so a reduction is contribute, barrier,
+    # serial fold on one core, barrier.
+    "collective": ("../workloads/syncron/collective --clients {clients} --ops {iters} "
+                   "--units {units} --cores-per-unit {cores_per_unit} --stack-mb {stack_mb}{check}"),
 }
 
 # The Synchronization Engine (Table 5). Only added to the config when --syncron is given.
@@ -170,6 +190,12 @@ NAME_PATTERNS = [
     (re.compile(r"^mesh(\d+)$"), lambda m, r: r.update(mesh_x=int(m.group(1)))),
     (re.compile(r"^(xbu)$"), lambda m, r: r.update(crossbar="per-unit")),
     (re.compile(r"^(nonet|noarena|trace|check)$"), lambda m, r: r.update(**{m.group(1): 1})),
+    (re.compile(r"^c(\d+)$"), lambda m, r: r.update(clients=int(m.group(1)))),
+    (re.compile(r"^o(\d+)$"), lambda m, r: r.update(ops=int(m.group(1)))),
+    (re.compile(r"^cap(\d+)$"), lambda m, r: r.update(cap=int(m.group(1)))),
+    (re.compile(r"^n(\d+)$"), lambda m, r: r.update(counters=int(m.group(1)))),
+    (re.compile(r"^m(\d+)$"), lambda m, r: r.update(monitors=int(m.group(1)))),
+    (re.compile(r"^(ph)$"), lambda m, r: r.update(ph=1)),
     (re.compile(r"^m([A-Za-z0-9.-]+)$"), lambda m, r: r.update(mem=m.group(1))),
 ]
 
@@ -184,7 +210,23 @@ SYNCRON_STATS = ("reqSync", "reqAsync", "barrierPolls", "localMsgs", "globalMsgs
 
 def name_of(a):
     parts = [f"{a.workload}_{a.mode if a.workload in ('probe', 'barrier') else 'se'}"]
-    if a.workload == "barrier":
+    if a.workload == "monitor":
+        parts += [a.scheme, f"u{a.units}x{a.cores_per_unit}", f"c{a.clients}", f"o{a.iters}", f"cap{a.cap}"]
+        if a.monitors > 1:
+            parts.append(f"m{a.monitors}")
+        if a.instrumented:
+            parts.append("ph")
+        parts += [f"st{a.st_entries}", f"l{a.link_ns}"]
+    elif a.workload in ("fetchadd", "ff"):
+        parts += [a.scheme, f"u{a.units}x{a.cores_per_unit}", f"c{a.clients}", f"o{a.iters}", f"n{a.counters}",
+                  f"st{a.st_entries}", f"l{a.link_ns}"]
+    elif a.workload == "putsignal":
+        parts += [a.scheme, f"u{a.units}x{a.cores_per_unit}", f"c{a.clients}", f"o{a.iters}", f"w{a.words}",
+                  f"st{a.st_entries}", f"l{a.link_ns}"]
+    elif a.workload == "collective":
+        parts += [a.scheme, f"u{a.units}x{a.cores_per_unit}", f"c{a.clients}", f"o{a.iters}",
+                  f"st{a.st_entries}", f"l{a.link_ns}"]
+    elif a.workload == "barrier":
         parts += [a.scheme, f"u{a.units}x{a.cores_per_unit}", f"c{a.clients_per_unit}x{a.units_used}",
                   f"g{a.groups}", f"st{a.st_entries}", f"l{a.link_ns}", f"w{a.warmup}"]
     else:
@@ -237,7 +279,8 @@ def write_cfg(a):
     l1_blocks = "".join(L1_GROUP.format(u=u, cores=a.cores_per_unit, l1=a.l1_bytes, l1lat=a.l1_latency, ways=a.l1_ways)
                         for u in range(a.units))
     llc_children = " ".join(f"l1i_u{u}|l1d_u{u}" for u in range(a.units))
-    cmd = WORKLOADS[a.workload].format(threads=a.threads, mode=a.mode, kb=a.kb, iters=a.iters, units=a.units,
+    cmd = WORKLOADS[a.workload].format(clients=a.clients, cap=a.cap, counters=a.counters, monitors=a.monitors, words=a.words,
+                                       phases="_ph" if a.instrumented else "", threads=a.threads, mode=a.mode, kb=a.kb, iters=a.iters, units=a.units,
                                        cores_per_unit=a.cores_per_unit, stack_mb=a.stack_mb, scheme=a.scheme,
                                        clients_per_unit=a.clients_per_unit, units_used=a.units_used,
                                        groups=a.groups, warmup=a.warmup, check=" --check" if a.check else "",
@@ -282,7 +325,7 @@ def done(name):
     if not log.exists():
         return False
     text = log.read_text(errors="replace")
-    return any(m in text for m in ("PROBE done", "PING done", "BARRIER done"))
+    return any(m in text for m in ("PROBE done", "PING done", "BARRIER done", "MONITOR done", "FETCHADD done", "FF done", "PUTSIGNAL done", "COLLECTIVE done"))
 
 
 def launch(a):
@@ -297,7 +340,7 @@ def launch(a):
     t0 = time.time()
     rc = subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     text = log.read_text(errors="replace") if log.exists() else ""
-    if rc == 0 and (not any(m in text for m in ("PROBE done", "PING done", "BARRIER done")) or "Panic" in text
+    if rc == 0 and (not any(m in text for m in ("PROBE done", "PING done", "BARRIER done", "MONITOR done", "FETCHADD done", "FF done", "PUTSIGNAL done", "COLLECTIVE done")) or "Panic" in text
                     or "Failed assertion" in text or "VERIFY FAIL" in text):
         rc = 3
     return name, rc, time.time() - t0, text
@@ -316,7 +359,12 @@ def summarise(name):
         row.update(threads=int(m.group(1)), ping_median=float(m.group(3)), ping_min=int(m.group(4)),
                    ping_max=int(m.group(5)))
     for line in text.splitlines():
-        if line.startswith("BARRIER ") and "=" in line:
+        if line.startswith("PHASE "):
+            f = line.split()
+            if len(f) >= 3 and f[2].startswith("cycles_per_op="):
+                row["ph_" + f[1]] = float(f[2].split("=")[1])
+            continue
+        if line.split(" ", 1)[0] in ("BARRIER", "MONITOR", "FETCHADD", "FF", "PUTSIGNAL", "COLLECTIVE") and "=" in line:
             for tok in line.split()[1:]:
                 if tok.count("=") == 1:
                     k, v = tok.split("=")
@@ -392,7 +440,14 @@ def main():
     ap.add_argument("--mode", default="stream", choices=["stream", "chase", "unit", "units"],
                     help="probe: stream|chase; barrier: unit|units (the barrier's scope)")
     ap.add_argument("--kb", type=int, default=256, help="per-thread working set")
-    ap.add_argument("--iters", type=int, default=20, help="probe iterations / ping reps / barrier rounds")
+    ap.add_argument("--iters", type=int, default=20,
+                    help="probe iterations / ping reps / barrier rounds / ops per client (S10 workloads)")
+    ap.add_argument("--clients", type=int, default=16, help="S10 workloads: client threads, one per core")
+    ap.add_argument("--cap", type=int, default=16, help="monitor: bounded-buffer capacity")
+    ap.add_argument("--monitors", type=int, default=1, help="monitor: independent monitors (client pairs share one)")
+    ap.add_argument("--instrumented", action="store_true", help="monitor: the _ph build, per-phase client timing")
+    ap.add_argument("--counters", type=int, default=1, help="fetchadd: counters / ff: cells")
+    ap.add_argument("--words", type=int, default=1, help="putsignal payload size in words (<= 8)")
     ap.add_argument("--stack-mb", type=int, default=1024, help="modelled memory per stack; must match the memory config")
     ap.add_argument("--no-arena", action="store_true", help="malloc instead of per-unit placement (the S1 baseline)")
     ap.add_argument("--mem", default="ramulator2-configs/HBM1-1Gb-4stack.yaml")
