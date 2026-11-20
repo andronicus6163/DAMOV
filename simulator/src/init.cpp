@@ -1052,6 +1052,9 @@ void SimInit(const char* configFile, const char* outputDir, uint32_t shmid) {
         sp.local_msg_cycles = config.get<uint32_t>("sys.syncron.localMsgCycles", 2);
         sp.global_msg_cycles = config.get<uint32_t>("sys.syncron.globalMsgCycles", 80);
         sp.bytes_per_unit = config.get<uint64_t>("sys.syncron.bytesPerUnit", 1ull << 30);
+        sp.home_interleave_bytes = config.get<uint64_t>("sys.syncron.homeInterleaveBytes", 0);
+        sp.route_atomics = config.get<bool>("sys.syncron.routeAtomics", false);
+        sp.gap_fill = config.get<bool>("sys.syncron.gapFill", false);
         sp.link_bw_gbps = config.get<double>("sys.syncron.linkBwGbps", 12.8);
         sp.mesh_x = config.get<uint32_t>("sys.syncron.meshX", 0);
         sp.trace_from = config.get<uint32_t>("sys.syncron.traceFrom", 0);

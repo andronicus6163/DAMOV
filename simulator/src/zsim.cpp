@@ -150,6 +150,7 @@ VOID SimThreadFini(THREADID tid);
 VOID SimEnd();
 
 VOID HandleMagicOp(THREADID tid, ADDRINT op, ADDRINT arg0, ADDRINT arg1, ADDRINT arg2, ADDRINT* ret);
+VOID HandleAtomic(THREADID tid, ADDRINT ea, UINT32 src);
 
 VOID FakeCPUIDPre(THREADID tid, REG eax, REG ecx);
 VOID FakeCPUIDPost(THREADID tid, ADDRINT* eax, ADDRINT* ebx, ADDRINT* ecx, ADDRINT* edx); //REG* eax, REG* ebx, REG* ecx, REG* edx);
@@ -613,6 +614,26 @@ VOID Instruction(INS ins) {
             INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR) IndirectRecordBranch, IARG_FAST_ANALYSIS_CALL, IARG_THREAD_ID,
                     IARG_INST_PTR, IARG_BRANCH_TAKEN, IARG_BRANCH_TARGET_ADDR, IARG_FALLTHROUGH_ADDR, IARG_END);
         }
+    }
+
+    // sys.syncron.routeAtomics: every atomic read-modify-write (LOCK prefix, or XCHG with a memory operand, which is
+    // implicitly locked) first takes a SynCron lock on its line; see SyncronSystem::atomicOp. Called before the
+    // instruction's own load/store callbacks, so its memory access happens after the grant. The source (app / OpenMP
+    // runtime / libc) is decided once here, from the routine and image the instruction is in.
+    if (zinfo->syncron && zinfo->syncron->routeAtomics() && INS_IsMemoryRead(ins) &&
+        (INS_LockPrefix(ins) || INS_Opcode(ins) == XED_ICLASS_XCHG)) {
+        uint32_t src = syncron::SyncronSystem::ATOMIC_SRC_APP;
+        RTN rtn = INS_Rtn(ins);
+        std::string rname = RTN_Valid(rtn) ? RTN_Name(rtn) : std::string();
+        IMG img = IMG_FindByAddress(INS_Address(ins));
+        if (rname.find("kmp") != std::string::npos || rname.compare(0, 5, "GOMP_") == 0 ||
+            rname.compare(0, 4, "omp_") == 0) {
+            src = syncron::SyncronSystem::ATOMIC_SRC_OMP;
+        } else if (IMG_Valid(img) && !IMG_IsMainExecutable(img)) {
+            src = syncron::SyncronSystem::ATOMIC_SRC_LIBC;
+        }
+        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR) HandleAtomic, IARG_CALL_ORDER, CALL_ORDER_FIRST,
+                       IARG_THREAD_ID, IARG_MEMORYREAD_EA, IARG_UINT32, src, IARG_END);
     }
 
     //Intercept and process magic ops
@@ -1210,6 +1231,14 @@ VOID SimEnd() {
 #define ZSIM_MAGIC_OP_NET_RECV          (1047)
 #define ZSIM_MAGIC_OP_PARK              (1048)
 #define ZSIM_MAGIC_OP_NOW_ABS           (1049)
+
+VOID HandleAtomic(THREADID tid, ADDRINT ea, UINT32 src) {
+    if (procTreeNode->isInFastForward()) return;
+    uint32_t cid = getCid(tid);
+    if (cid >= zinfo->numCores) return;
+    Core* core = zinfo->cores[cid];
+    core->idleUntil(zinfo->syncron->atomicOp(cid, ea, src, core->getCurCycle()));
+}
 
 VOID HandleMagicOp(THREADID tid, ADDRINT op, ADDRINT arg0, ADDRINT arg1, ADDRINT arg2, ADDRINT* ret) {
     //std::cout << "HandleMagicOp: " << op << std::endl;

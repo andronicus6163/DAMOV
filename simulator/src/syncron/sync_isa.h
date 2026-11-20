@@ -25,8 +25,14 @@ enum Opcode : uint32_t {
     OP_BARRIER_POLL = 5,          // not in the paper: "has my release cycle been decided?" -- see sync_engine.h
     OP_PARK = 6,                  // not in the paper: park this core until the end of the simulator phase, so a core
                                   // with no role in the run keeps its core id without spending instructions
-    // Locks, semaphores and condition variables are S10; the SE rejects their opcodes until then.
-    OP_COUNT = 7,
+    // S10 (Sec 4.1). Numbering reconstructed 2026-11-20 (the original values were lost); keep in sync with
+    // misc/hooks/syncron_isa.h. Semaphores are not modelled.
+    OP_LOCK_ACQUIRE = 7,          // lock_acquire(): granted by the variable's Master SE; 0 = queued, poll
+    OP_LOCK_RELEASE = 8,          // lock_release(): release semantics, the core does not wait
+    OP_COND_WAIT = 9,             // cond_wait(): info = the lock's address; always parks, poll for the re-grant
+    OP_COND_SIGNAL = 10,          // cond_signal(): info = the lock's address
+    OP_COND_BROADCAST = 11,       // cond_broadcast(): info = the lock's address
+    OP_COUNT = 12,
 };
 
 inline const char* opcode_name(uint32_t op) {
@@ -38,6 +44,11 @@ inline const char* opcode_name(uint32_t op) {
         case OP_BARRIER_ACROSS_UNITS: return "barrier_across_units";
         case OP_BARRIER_POLL: return "barrier_poll";
         case OP_PARK: return "park";
+        case OP_LOCK_ACQUIRE: return "lock_acquire";
+        case OP_LOCK_RELEASE: return "lock_release";
+        case OP_COND_WAIT: return "cond_wait";
+        case OP_COND_SIGNAL: return "cond_signal";
+        case OP_COND_BROADCAST: return "cond_broadcast";
         default: return "?";
     }
 }

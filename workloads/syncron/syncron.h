@@ -76,5 +76,28 @@ inline void syncron_barrier_wait_across_units(const SyncVar& v) {
     syncron_barrier_wait(v, SYNCRON_OP_BARRIER_ACROSS_UNITS);
 }
 
+// S10 (Sec 4.1): lock_acquire / lock_release and the condition variables a monitor is built from. Acquiring blocks
+// until the SE grants the lock; releasing has release semantics and does not wait. condvar_wait releases the lock and
+// parks, and returns holding the lock again -- Mesa semantics, so the caller re-tests its predicate in a while loop.
+inline void syncron_lock_acquire(const SyncVar& v) {
+    if (req_sync(v.addr, SYNCRON_OP_LOCK_ACQUIRE, 0)) return;          // granted at once
+    while (!req_sync(v.addr, SYNCRON_OP_BARRIER_POLL, 0)) { }       // queued: wait for the hand-off
+}
+
+inline void syncron_lock_release(const SyncVar& v) { req_sync(v.addr, SYNCRON_OP_LOCK_RELEASE, 0); }
+
+inline void syncron_cond_wait(const SyncVar& cv, const SyncVar& lk) {
+    req_sync(cv.addr, SYNCRON_OP_COND_WAIT, (uint64_t)lk.addr);     // always parks (the engine returns 0)
+    while (!req_sync(cv.addr, SYNCRON_OP_BARRIER_POLL, 0)) { }      // signalled AND the lock re-granted
+}
+
+inline void syncron_cond_signal(const SyncVar& cv, const SyncVar& lk) {
+    req_sync(cv.addr, SYNCRON_OP_COND_SIGNAL, (uint64_t)lk.addr);
+}
+
+inline void syncron_cond_broadcast(const SyncVar& cv, const SyncVar& lk) {
+    req_sync(cv.addr, SYNCRON_OP_COND_BROADCAST, (uint64_t)lk.addr);
+}
+
 // Not in the paper: a bare round trip to the local SE, for checking the ISA path and its latency.
 inline uint64_t syncron_ping(const volatile void* addr) { return req_sync(addr, SYNCRON_OP_PING, 0); }

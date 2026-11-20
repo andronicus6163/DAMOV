@@ -82,6 +82,7 @@
 
 #include "g_std/g_string.h"
 #include "g_std/g_unordered_map.h"
+#include "g_std/g_multimap.h"
 #include "g_std/g_vector.h"
 #include "galloc.h"
 #include "locks.h"
@@ -122,6 +123,20 @@ struct Params {
     uint32_t msg_bytes = 18;           // Sec 4.2: 64 + 6 + 6 + 64 bits = 140 bits (the 6-bit core id grows past 64 cores)
     uint32_t mesh_x = 0;               // 0 = one link per pair of units; > 0 = 2D mesh this many units wide
     uint64_t bytes_per_unit = 1ull << 30;
+    // Home unit of an address when memory is NOT unit-major: 0 = unit-major ((addr / bytes_per_unit) % units);
+    // > 0 = the memory interleaves units in chunks of this many bytes, (addr / home_interleave_bytes) % units.
+    // It must match the memory model's own mapping (HBMStack channel_interleave: 64 B transactions x 32 column
+    // positions = 2 KiB per channel, 16 channels per stack -> 32 KiB per unit).
+    uint64_t home_interleave_bytes = 0;
+    // Route every atomic read-modify-write instruction (LOCK prefix, XCHG with memory) through a SynCron lock on its
+    // cache line (zsim.cpp HandleAtomic -> atomicOp). Off by default: the existing SynCron workloads do not need it.
+    bool route_atomics = false;
+    // How an SPU (and an inter-unit link) orders the messages it serves. false (default, every SynCron result so far):
+    // in the order zsim's bound phase calls it, with one "free at" cursor -- a message processed after a later-timed
+    // one queues behind it even if the SPU was idle at its own arrival (the spuInversions stats). true: a calendar
+    // per SPU / link direction, each message takes the first free slot at or after its own arrival, so idle gaps
+    // left by call order are used. Needed when many cores load one SE at once (the PIM baseline's atomics).
+    bool gap_fill = false;
     // Sec 4.4 overflow: one syncronVar access costs this much SPU time. Measured on this machine model, not invented:
     // the S2 pointer-chase run reports pim_latency/pim_requests = 29.4 memory ticks = 58.8 ns = 118 core cycles at
     // 2 GHz. The paper does not say how many accesses a message needs, so the two counts below are this model's
@@ -134,6 +149,42 @@ struct Params {
     // [trace_from, trace_from + trace_count) is logged with its cycles. Off by default.
     uint32_t trace_from = 0;
     uint32_t trace_count = 0;
+};
+
+/* Busy intervals of one server (an SPU or one link direction), for gap_fill. Disjoint, merged when touching; old
+ * intervals are dropped once they end more than HORIZON cycles before the message being placed (bound-phase skew
+ * is at most a few phases, far below it). */
+struct Calendar {
+    static const uint64_t HORIZON = 1ull << 22;
+    g_map<uint64_t, uint64_t> busy;  // start -> end
+    uint64_t reserve(uint64_t arrival, uint64_t dur) {
+        while (!busy.empty() && busy.begin()->second + HORIZON < arrival) busy.erase(busy.begin());
+        uint64_t s = arrival;
+        auto it = busy.upper_bound(s);
+        if (it != busy.begin()) {
+            auto pv = std::prev(it);
+            if (pv->second > s) s = pv->second;
+        }
+        while (it != busy.end() && it->first < s + dur) {
+            if (it->second > s) s = it->second;
+            ++it;
+        }
+        uint64_t e = s + dur;
+        auto nx = busy.lower_bound(s);
+        if (nx != busy.end() && nx->first == e) {
+            e = nx->second;
+            nx = busy.erase(nx);
+        }
+        if (nx != busy.begin()) {
+            auto pv = std::prev(nx);
+            if (pv->second == s) {
+                pv->second = e;
+                return s;
+            }
+        }
+        busy.insert(nx, std::make_pair(s, e));
+        return s;
+    }
 };
 
 class SyncronSystem : public GlobAlloc {
@@ -158,7 +209,18 @@ class SyncronSystem : public GlobAlloc {
     void initStats(AggregateStat* parent);
 
     uint32_t unitOfCore(uint32_t core_id) const { return (core_id / p.cores_per_unit) % p.units; }
-    uint32_t masterUnitOf(uint64_t addr) const { return (uint32_t)((addr / p.bytes_per_unit) % p.units); }
+    uint32_t masterUnitOf(uint64_t addr) const {
+        return p.home_interleave_bytes ? (uint32_t)((addr / p.home_interleave_bytes) % p.units)
+                                       : (uint32_t)((addr / p.bytes_per_unit) % p.units);
+    }
+
+    /* An atomic read-modify-write instruction (route_atomics) made a SynCron lock_acquire / lock_release on its
+     * 64-byte line, coordinated by the line's Master SE. The critical section is that one instruction, so the lock
+     * is held from its grant until the Master SE has served the core's release. Returns the grant cycle: the core
+     * is stalled until then and the instruction's own memory access follows. `src` = ATOMIC_SRC_*. */
+    uint64_t atomicOp(uint32_t core_id, uint64_t addr, uint32_t src, uint64_t now);
+    enum { ATOMIC_SRC_APP = 0, ATOMIC_SRC_OMP = 1, ATOMIC_SRC_LIBC = 2, ATOMIC_SRC_COUNT = 3 };
+    bool routeAtomics() const { return p.route_atomics; }
 
     static const uint64_t MSG_VALID = 1ull << 63;
     static const uint32_t MSG_SRC_SHIFT = 48;
@@ -187,6 +249,22 @@ class SyncronSystem : public GlobAlloc {
         g_vector<uint32_t> waiters;
     };
 
+    /* S10. One lock, held by the variable's Master SE: who owns it and the FIFO of cores waiting for it. */
+    struct LockState {
+        bool held = false;
+        uint32_t owner = (uint32_t)-1;
+        g_vector<uint32_t> waiters;
+        g_vector<uint64_t> waiter_since;  // when the Master SPU served that acquire
+        uint64_t free_at = 0;             // when the lock last changed hands; a grant cannot be earlier
+    };
+
+    /* One condition variable: cores parked on it, and the lock each one must hold again when it wakes. */
+    struct CondState {
+        g_vector<uint32_t> waiters;
+        g_vector<uint64_t> since;
+        g_vector<uint64_t> lock_addr;
+    };
+
     struct STEntry {
         uint64_t addr = 0;
         bool occupied = false;
@@ -200,10 +278,14 @@ class SyncronSystem : public GlobAlloc {
 
     struct Engine {
         uint64_t spu_free = 0;
+        Calendar spu_cal;  // gap_fill only
         uint64_t last_served_arrival = 0;  // arrival cycle of the message this SPU served last
         g_vector<STEntry> st;
         g_unordered_map<uint64_t, BarrierState> barriers;  // keyed by variable address
         g_unordered_map<uint64_t, LocalBarrier> local_barriers;  // two-level barriers, this SE's own cores
+        g_unordered_map<uint64_t, LockState> locks;              // S10, keyed by variable address
+        g_unordered_map<uint64_t, uint64_t> atomic_free;         // atomics: line -> cycle its lock is free again
+        g_unordered_map<uint64_t, CondState> conds;
         g_vector<uint32_t> counters;                       // indexing counters (Sec 4.4)
         uint32_t st_used = 0;
     };
@@ -216,6 +298,15 @@ class SyncronSystem : public GlobAlloc {
     uint32_t counterIdx(uint64_t addr) const { return (uint32_t)((addr >> 6) % p.indexing_counters); }
     bool stAlloc(uint32_t unit, uint64_t addr);  // false = no entry: the variable goes to memory mode (Sec 4.4)
     void stFree(uint32_t unit, uint64_t addr);
+    /* S10 helpers. requestPath: core -> its local SE -> (link) -> the variable's Master SE; returns when the Master's
+     * SPU has served the message. grantPath: the Master sends an ACK/grant back to one core the same way. */
+    uint64_t requestPath(uint32_t core_id, uint32_t master, uint64_t now, uint32_t extra, const char* op);
+    uint64_t grantPath(uint32_t master, uint32_t core_id, uint64_t from, const char* op);
+    uint64_t lockAcquire(uint32_t core_id, uint64_t addr, uint64_t now);
+    void lockRelease(uint32_t core_id, uint64_t addr, uint64_t now);
+    void lockHandOff(uint32_t master, uint64_t addr, uint64_t from);  // give a free lock to the next waiter
+    uint64_t condWait(uint32_t core_id, uint64_t cv_addr, uint64_t lock_addr, uint64_t now);
+    void condWake(uint32_t core_id, uint64_t cv_addr, uint64_t lock_addr, uint64_t now, bool all);
     uint64_t barrierArrive(uint32_t core_id, uint64_t addr, bool across_units, uint64_t now);
     uint64_t barrierArriveTwoLevel(uint32_t core_id, uint32_t unit, uint32_t coord, uint64_t addr,
                                    uint32_t participants, uint64_t now);
@@ -230,6 +321,7 @@ class SyncronSystem : public GlobAlloc {
     uint32_t overflow_mem_core_cycles;
     uint32_t link_occupancy_cycles;     // one message on one link, in core cycles
     g_vector<uint64_t> link_free;       // [src_unit * units + dst_unit]: when that direction is free again
+    g_vector<Calendar> link_cal;        // gap_fill only, same indexing
     uint32_t num_cores;
     g_vector<Engine> engines;
     g_vector<uint64_t> release_of_core;  // 0 = nothing decided yet
@@ -237,6 +329,8 @@ class SyncronSystem : public GlobAlloc {
     g_unordered_map<uint64_t, uint32_t> registered;  // variable address -> participant count from create_syncvar
     lock_t lock;
 
+    Counter s_lock_acquires, s_lock_releases, s_lock_contended, s_lock_handoffs, s_cond_waits, s_cond_signals,
+        s_cond_woken;
     Counter s_sync_reqs, s_async_reqs, s_polls, s_local_msgs, s_global_msgs, s_queue_cycles, s_service_cycles,
         s_rejected_opcode, s_barriers, s_barrier_participants, s_barrier_release_cycles, s_barrier_span_cycles,
         s_barrier_skew_cycles, s_st_peak, s_arrivals, s_overflow_msgs, s_overflow_barriers, s_overflow_aliased,
@@ -244,6 +338,8 @@ class SyncronSystem : public GlobAlloc {
         s_sw_global_msgs, s_sw_recv, s_sw_recv_empty, s_sw_msg_wait_cycles, s_link_msgs, s_link_bytes,
         s_link_queue_cycles, s_link_max_queue, s_two_level_barriers, s_early_releases, s_spu_inversions, s_spu_inversion_cycles, s_link_hops;
     VectorCounter s_msgs_per_unit, s_msgs_per_opcode, s_barriers_per_unit;
+    Counter s_atomics, s_atomic_remote, s_atomic_contended, s_atomic_wait_cycles, s_atomic_grant_cycles;
+    VectorCounter s_atomics_per_src;
 };
 
 }  // namespace syncron

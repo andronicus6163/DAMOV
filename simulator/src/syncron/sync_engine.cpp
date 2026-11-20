@@ -30,6 +30,7 @@ SyncronSystem::SyncronSystem(const Params& params, uint32_t core_freq_mhz, uint3
     release_of_core.resize(num_cores, 0);
     inbox.resize(num_cores);
     link_free.resize((size_t)p.units * p.units, 0);
+    if (p.gap_fill) link_cal.resize((size_t)p.units * p.units);
     futex_init(&lock);
     info("[SYNCRON] scheme %s, %u units x %u cores, SPU %u MHz x %u cycles = %u core cycles/message, "
          "core<->SE %u cyc, link %u cyc + %u B at %.1f GB/s = %u cyc occupancy, ST %u entries, %u counters, "
@@ -48,20 +49,21 @@ uint64_t SyncronSystem::serve(uint32_t unit, uint64_t arrival, uint32_t extra_cy
         s_spu_inversion_cycles.inc(e.last_served_arrival - arrival);
     }
     e.last_served_arrival = arrival;
-    uint64_t start = MAX(arrival, e.spu_free);
+    uint64_t dur = service_core_cycles + extra_cycles;
+    uint64_t start = p.gap_fill ? e.spu_cal.reserve(arrival, dur) : MAX(arrival, e.spu_free);
     s_queue_cycles.inc(start - arrival);
-    s_service_cycles.inc(service_core_cycles + extra_cycles);
-    e.spu_free = start + service_core_cycles + extra_cycles;
+    s_service_cycles.inc(dur);
+    e.spu_free = MAX(e.spu_free, start + dur);
     s_msgs_per_unit.inc(unit);
-    return e.spu_free;
+    return start + dur;
 }
 
 uint64_t SyncronSystem::crossLink(uint32_t src_unit, uint32_t dst_unit, uint64_t depart) {
     uint64_t t = depart;
     auto traverse = [&](uint32_t from, uint32_t to) {
         size_t dir = (size_t)from * p.units + to;
-        uint64_t ready = MAX(t, link_free[dir]);
-        link_free[dir] = ready + link_occupancy_cycles;
+        uint64_t ready = p.gap_fill ? link_cal[dir].reserve(t, link_occupancy_cycles) : MAX(t, link_free[dir]);
+        link_free[dir] = MAX(link_free[dir], ready + link_occupancy_cycles);
         uint64_t wait = ready - t;
         s_link_hops.inc();
         s_link_queue_cycles.inc(wait);
@@ -443,6 +445,200 @@ bool SyncronSystem::msgRecv(uint32_t core_id, uint64_t now, uint64_t* word, uint
     return found;
 }
 
+/* ------------------------------------------------------------------ S10: locks and condition variables ---------
+ * Sec 4.1's lock_acquire / lock_release / condvar_wait / condvar_signal / condvar_broadcast, coordinated by the
+ * variable's Master SE exactly as barriers are: every message occupies an SPU for one service time, and crosses the
+ * inter-unit link when the core is not in the Master's unit. A core that cannot be served at once (a held lock, a
+ * condition that has not been signalled) is told to poll, and the engine writes its release cycle when the lock is
+ * handed to it -- the same mechanism barriers use, so waiting costs the application no instructions.
+ *
+ * NOT MODELLED: the paper's Sec 4.4 overflow for locks (an ST that is full re-directs to memory). The monitor
+ * workload uses three variables per monitor, far below Table 5's 64 entries, so the path is unreachable here; it is
+ * left out rather than modelled untested, as the two-level barrier comment says.
+ */
+uint64_t SyncronSystem::requestPath(uint32_t core_id, uint32_t master, uint64_t now, uint32_t extra, const char* op) {
+    uint32_t unit = unitOfCore(core_id);
+    uint64_t served;
+    if (unit == master) {
+        served = serve(unit, now + p.local_msg_cycles, extra);
+        s_local_msgs.inc();
+        traceMsg("%s core %u -> Master SE%u: sent %lu, served %lu", op, core_id, master, now, served);
+    } else {
+        uint64_t at_local = serve(unit, now + p.local_msg_cycles);
+        s_local_msgs.inc();
+        uint64_t arrive = crossLink(unit, master, at_local);
+        served = serve(master, arrive, extra);
+        s_global_msgs.inc();
+        traceMsg("%s core %u -> SE%u -> Master SE%u: sent %lu, link arrive %lu, served %lu", op, core_id, unit, master,
+                 now, arrive, served);
+    }
+    return served;
+}
+
+uint64_t SyncronSystem::grantPath(uint32_t master, uint32_t core_id, uint64_t from, const char* op) {
+    uint32_t unit = unitOfCore(core_id);
+    Engine& me = engines[master];
+    // gap_fill: the grant takes the SPU's first free slot after `from`; otherwise it queues behind the cursor.
+    uint64_t sent = serve(master, p.gap_fill ? from : MAX(from, me.spu_free));
+    uint64_t release;
+    if (unit == master) {
+        s_local_msgs.inc();
+        release = sent + p.local_msg_cycles;
+    } else {
+        uint64_t arrive = crossLink(master, unit, sent);
+        uint64_t taken = serve(unit, arrive);
+        s_global_msgs.inc();
+        release = taken + p.local_msg_cycles;
+    }
+    traceMsg("%s Master SE%u -> core %u: sent %lu, release %lu", op, master, core_id, sent, release);
+    return release;
+}
+
+/* Give a free lock to the core at the head of its queue, if any. `from` is the cycle the lock became free. */
+void SyncronSystem::lockHandOff(uint32_t master, uint64_t addr, uint64_t from) {
+    Engine& e = engines[master];
+    LockState& l = e.locks[addr];
+    if (l.held || l.waiters.empty()) return;
+    uint32_t next = l.waiters.front();
+    uint64_t since = l.waiter_since.front();
+    l.waiters.erase(l.waiters.begin());
+    l.waiter_since.erase(l.waiter_since.begin());
+    l.held = true;
+    l.owner = next;
+    uint64_t grant = grantPath(master, next, MAX(from, since), "lock_grant");
+    l.free_at = grant;
+    release_of_core[next] = grant;
+    s_lock_handoffs.inc();
+}
+
+uint64_t SyncronSystem::lockAcquire(uint32_t core_id, uint64_t addr, uint64_t now) {
+    uint32_t master = masterUnitOf(addr);
+    Engine& e = engines[master];
+    LockState& l = e.locks[addr];
+    if (!l.held && l.waiters.empty()) stAlloc(master, addr);
+    uint64_t served = requestPath(core_id, master, now, 0, "lock_acquire");
+    s_lock_acquires.inc();
+    if (!l.held && l.waiters.empty()) {
+        l.held = true;
+        l.owner = core_id;
+        uint64_t grant = grantPath(master, core_id, MAX(served, l.free_at), "lock_grant");
+        l.free_at = grant;
+        return grant;  // the core resumes holding the lock
+    }
+    l.waiters.push_back(core_id);
+    l.waiter_since.push_back(served);
+    s_lock_contended.inc();
+    return 0;  // poll until the lock is handed over
+}
+
+void SyncronSystem::lockRelease(uint32_t core_id, uint64_t addr, uint64_t now) {
+    uint32_t master = masterUnitOf(addr);
+    Engine& e = engines[master];
+    LockState& l = e.locks[addr];
+    uint64_t served = requestPath(core_id, master, now, 0, "lock_release");
+    s_lock_releases.inc();
+    l.held = false;
+    l.owner = (uint32_t)-1;
+    l.free_at = MAX(l.free_at, served);
+    lockHandOff(master, addr, l.free_at);
+    if (!l.held && l.waiters.empty()) {
+        stFree(master, addr);
+        e.locks.erase(addr);
+    }
+}
+
+/* condvar_wait: release the lock and park on the condition. The core wakes holding the lock again. */
+uint64_t SyncronSystem::condWait(uint32_t core_id, uint64_t cv_addr, uint64_t lock_addr, uint64_t now) {
+    uint32_t master = masterUnitOf(cv_addr);
+    Engine& e = engines[master];
+    uint64_t served = requestPath(core_id, master, now, 0, "cond_wait");
+    s_cond_waits.inc();
+    CondState& c = e.conds[cv_addr];
+    if (c.waiters.empty()) stAlloc(master, cv_addr);
+    c.waiters.push_back(core_id);
+    c.since.push_back(served);
+    c.lock_addr.push_back(lock_addr);
+    // The lock this core held is released by the same message (the SE holds both variables).
+    uint32_t lmaster = masterUnitOf(lock_addr);
+    Engine& le = engines[lmaster];
+    LockState& l = le.locks[lock_addr];
+    uint64_t freed = served;
+    if (lmaster != master) {  // the lock lives in another unit: one message to its Master SE
+        uint64_t sent = serve(master, MAX(served, e.spu_free));
+        uint64_t arrive = crossLink(master, lmaster, sent);
+        freed = serve(lmaster, arrive);
+        s_global_msgs.inc();
+    }
+    l.held = false;
+    l.owner = (uint32_t)-1;
+    l.free_at = MAX(l.free_at, freed);
+    lockHandOff(lmaster, lock_addr, l.free_at);
+    return 0;  // always parks; the grant comes after a signal and the re-acquire
+}
+
+/* condvar_signal / condvar_broadcast: move waiters from the condition to the lock's queue. A woken core holds the
+ * lock when it resumes, so a signal that finds the lock free hands it over straight away. */
+void SyncronSystem::condWake(uint32_t core_id, uint64_t cv_addr, uint64_t lock_addr, uint64_t now, bool all) {
+    uint32_t master = masterUnitOf(cv_addr);
+    Engine& e = engines[master];
+    uint64_t served = requestPath(core_id, master, now, 0, all ? "cond_broadcast" : "cond_signal");
+    s_cond_signals.inc();
+    g_unordered_map<uint64_t, CondState>::iterator it = e.conds.find(cv_addr);
+    if (it == e.conds.end() || it->second.waiters.empty()) return;  // nobody waiting: the signal is lost (Mesa)
+    CondState& c = it->second;
+    uint32_t lmaster = masterUnitOf(lock_addr);
+    LockState& l = engines[lmaster].locks[lock_addr];
+    uint32_t n = all ? (uint32_t)c.waiters.size() : 1;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t w = c.waiters.front();
+        uint64_t since = MAX(c.since.front(), served);
+        c.waiters.erase(c.waiters.begin());
+        c.since.erase(c.since.begin());
+        c.lock_addr.erase(c.lock_addr.begin());
+        l.waiters.push_back(w);
+        l.waiter_since.push_back(since);
+        s_cond_woken.inc();
+    }
+    lockHandOff(lmaster, lock_addr, MAX(served, l.free_at));
+    if (c.waiters.empty()) {
+        stFree(master, cv_addr);
+        e.conds.erase(cv_addr);
+    }
+}
+
+/* ------------------------------------------------------------------ atomics through SynCron locks -------------
+ * PIM baseline (plans/PIM-BASELINE-SYNCRON-HBM3E-SCOPE.md, decision D3): SynCron's NDP units have no hardware
+ * coherence, so an atomic read-modify-write cannot be an ordinary cached access. Every one is made a lock_acquire /
+ * lock_release pair on the instruction's 64-byte line, through the same request/grant paths as S10's locks (SPU
+ * service per message, core <-> SE, inter-unit links). The critical section is the instruction itself, so the
+ * hold time is known at grant time and no polling is needed: a later acquire of the same line waits until the
+ * Master SE has served the holder's release. The release is asynchronous (the core does not wait for it).
+ * NOT MODELLED, as for S10 locks: Synchronization Table overflow (a held atomic lock occupies an entry only for the
+ * few cycles between grant and release).
+ */
+uint64_t SyncronSystem::atomicOp(uint32_t core_id, uint64_t addr, uint32_t src, uint64_t now) {
+    futex_lock(&lock);
+    uint64_t line = addr & ~63ull;
+    uint32_t master = masterUnitOf(line);
+    Engine& e = engines[master];
+    uint64_t served = requestPath(core_id, master, now, 0, "atomic_acquire");
+    uint64_t& free_at = e.atomic_free[line];
+    uint64_t start = served;
+    if (free_at > served) {
+        s_atomic_contended.inc();
+        s_atomic_wait_cycles.inc(free_at - served);
+        start = free_at;
+    }
+    uint64_t grant = grantPath(master, core_id, start, "atomic_grant");
+    free_at = requestPath(core_id, master, grant, 0, "atomic_release");
+    if (unitOfCore(core_id) != master) s_atomic_remote.inc();
+    s_atomics.inc();
+    s_atomics_per_src.inc(src < ATOMIC_SRC_COUNT ? src : ATOMIC_SRC_APP);
+    s_atomic_grant_cycles.inc(grant - now);
+    futex_unlock(&lock);
+    return grant;
+}
+
 uint64_t SyncronSystem::reqSync(uint32_t core_id, uint64_t addr, uint32_t opcode, uint64_t info, uint64_t now) {
     futex_lock(&lock);
     if (opcode < OP_COUNT) s_msgs_per_opcode.inc(opcode);
@@ -497,6 +693,53 @@ uint64_t SyncronSystem::reqSync(uint32_t core_id, uint64_t addr, uint32_t opcode
                       : barrierArrive(core_id, addr, opcode == OP_BARRIER_ACROSS_UNITS, now);
             break;
         }
+        case OP_LOCK_ACQUIRE: {
+            s_sync_reqs.inc();
+            if (p.scheme == SCHEME_IDEAL) {  // zero-cost, but still mutual exclusion
+                Engine& e = engines[masterUnitOf(addr)];
+                LockState& l = e.locks[addr];
+                if (!l.held && l.waiters.empty()) { l.held = true; l.owner = core_id; ack = now; }
+                else { l.waiters.push_back(core_id); l.waiter_since.push_back(now); ack = 0; }
+                break;
+            }
+            ack = lockAcquire(core_id, addr, now);
+            break;
+        }
+        case OP_LOCK_RELEASE: {
+            s_sync_reqs.inc();
+            if (p.scheme == SCHEME_IDEAL) {
+                uint32_t master = masterUnitOf(addr);
+                LockState& l = engines[master].locks[addr];
+                l.held = false;
+                if (!l.waiters.empty()) {
+                    uint32_t w = l.waiters.front();
+                    l.waiters.erase(l.waiters.begin());
+                    l.waiter_since.erase(l.waiter_since.begin());
+                    l.held = true;
+                    l.owner = w;
+                    release_of_core[w] = now;
+                }
+                ack = now;
+                break;
+            }
+            lockRelease(core_id, addr, now);
+            ack = now;  // release semantics: the core does not wait for the SE
+            break;
+        }
+        case OP_COND_WAIT: {
+            s_sync_reqs.inc();
+            if (!info) panic("[SYNCRON] cond_wait at 0x%lx needs the lock's address in info", addr);
+            ack = condWait(core_id, addr, info, now);
+            break;
+        }
+        case OP_COND_SIGNAL:
+        case OP_COND_BROADCAST: {
+            s_sync_reqs.inc();
+            if (!info) panic("[SYNCRON] cond_signal at 0x%lx needs the lock's address in info", addr);
+            condWake(core_id, addr, info, now, opcode == OP_COND_BROADCAST);
+            ack = now;
+            break;
+        }
         default:
             s_rejected_opcode.inc();
             futex_unlock(&lock);
@@ -530,6 +773,24 @@ void SyncronSystem::initStats(AggregateStat* parent) {
     st->init("syncron", "SynCron synchronization engine stats");
     s_sync_reqs.init("reqSync", "req_sync instructions that carried a message"); st->append(&s_sync_reqs);
     s_async_reqs.init("reqAsync", "req_async instructions"); st->append(&s_async_reqs);
+    s_lock_acquires.init("lockAcquires", "lock_acquire messages"); st->append(&s_lock_acquires);
+    s_lock_releases.init("lockReleases", "lock_release messages"); st->append(&s_lock_releases);
+    s_lock_contended.init("lockContended", "acquires that found the lock held"); st->append(&s_lock_contended);
+    s_lock_handoffs.init("lockHandoffs", "locks handed from one core to the next"); st->append(&s_lock_handoffs);
+    s_cond_waits.init("condWaits", "condvar_wait messages"); st->append(&s_cond_waits);
+    s_cond_signals.init("condSignals", "condvar_signal / broadcast messages"); st->append(&s_cond_signals);
+    s_cond_woken.init("condWoken", "waiters moved from a condition variable to its lock"); st->append(&s_cond_woken);
+    s_atomics.init("atomics", "atomic RMW instructions routed through a SynCron lock (route_atomics)");
+    st->append(&s_atomics);
+    s_atomics_per_src.init("atomicsPerSrc", "of those, by source: 0 app, 1 OpenMP runtime, 2 libc/loader",
+                           ATOMIC_SRC_COUNT);
+    st->append(&s_atomics_per_src);
+    s_atomic_remote.init("atomicRemote", "atomics whose line's Master SE is in another unit"); st->append(&s_atomic_remote);
+    s_atomic_contended.init("atomicContended", "atomics that found their line's lock held"); st->append(&s_atomic_contended);
+    s_atomic_wait_cycles.init("atomicWaitCycles", "summed cycles those waited for the lock to be released");
+    st->append(&s_atomic_wait_cycles);
+    s_atomic_grant_cycles.init("atomicGrantCycles", "summed issue -> grant cycles (the stall each atomic adds)");
+    st->append(&s_atomic_grant_cycles);
     s_polls.init("barrierPolls", "release-cycle checks (no modelled cost; a simulator artefact)");
     st->append(&s_polls);
     s_local_msgs.init("localMsgs", "messages between a core and its local SE"); st->append(&s_local_msgs);

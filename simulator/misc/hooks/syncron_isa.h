@@ -22,6 +22,12 @@
 #define SYNCRON_OP_BARRIER_ACROSS_UNITS 4
 #define SYNCRON_OP_BARRIER_POLL         5
 #define SYNCRON_OP_PARK                 6
+/* S10: lock + condition variables (numbering reconstructed 2026-11-20; must match sync_isa.h) */
+#define SYNCRON_OP_LOCK_ACQUIRE         7
+#define SYNCRON_OP_LOCK_RELEASE         8
+#define SYNCRON_OP_COND_WAIT            9
+#define SYNCRON_OP_COND_SIGNAL          10
+#define SYNCRON_OP_COND_BROADCAST       11
 
 #ifdef __x86_64__
 /* Returns the cycle the SE answered at (the core was stalled until then). */
